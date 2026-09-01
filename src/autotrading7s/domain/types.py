@@ -83,6 +83,10 @@ class LimitOrderRequest:
     client_ref: UUID
 
     def __post_init__(self) -> None:
+        if isinstance(self.qty, bool) or not isinstance(self.qty, int):
+            raise TypeError(f"qty must be int, not {type(self.qty).__name__}")
+        if isinstance(self.price, bool) or not isinstance(self.price, int):
+            raise TypeError(f"price must be int, not {type(self.price).__name__}")
         if self.qty <= 0:
             raise ValueError(f"qty must be positive: {self.qty}")
         if self.price <= 0:
@@ -103,6 +107,8 @@ class MarketSellRequest:
     reason: str
 
     def __post_init__(self) -> None:
+        if isinstance(self.qty, bool) or not isinstance(self.qty, int):
+            raise TypeError(f"qty must be int, not {type(self.qty).__name__}")
         if self.qty <= 0:
             raise ValueError(f"qty must be positive: {self.qty}")
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 from datetime import datetime, timezone
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
@@ -67,6 +68,55 @@ def test_market_sell_request_allows_empty_reason():
     """사용자 입력은 선택이므로 빈 문자열은 허용한다 (설계서 14.3절)."""
     req = MarketSellRequest(code="005930", qty=1, client_ref=uuid4(), reason="")
     assert req.reason == ""
+
+
+def test_limit_order_request_rejects_float_qty():
+    """설계서 3.1절: float은 금액 계산에 쓸 수 없다."""
+    with pytest.raises(TypeError, match="qty must be int"):
+        LimitOrderRequest(code="005930", side=Side.BUY, qty=100.5, price=9340,  # type: ignore[arg-type]
+                          client_ref=uuid4())
+
+
+def test_limit_order_request_rejects_float_price():
+    """설계서 3.1절: float은 금액 계산에 쓸 수 없다."""
+    with pytest.raises(TypeError, match="price must be int"):
+        LimitOrderRequest(code="005930", side=Side.BUY, qty=100, price=9340.5,  # type: ignore[arg-type]
+                          client_ref=uuid4())
+
+
+def test_limit_order_request_rejects_bool_qty():
+    """bool은 int의 서브클래스지만 거절한다."""
+    with pytest.raises(TypeError, match="qty must be int"):
+        LimitOrderRequest(code="005930", side=Side.BUY, qty=True,  # type: ignore[arg-type]
+                          price=9340, client_ref=uuid4())
+
+
+def test_limit_order_request_rejects_bool_price():
+    """bool은 int의 서브클래스지만 거절한다."""
+    with pytest.raises(TypeError, match="price must be int"):
+        LimitOrderRequest(code="005930", side=Side.BUY, qty=100, price=False,  # type: ignore[arg-type]
+                          client_ref=uuid4())
+
+
+def test_limit_order_request_rejects_decimal_price():
+    """Decimal은 금액 계산에 쓸 수 있지만 이 타입에서는 거절한다."""
+    with pytest.raises(TypeError, match="price must be int"):
+        LimitOrderRequest(code="005930", side=Side.BUY, qty=100, price=Decimal("9340.50"),  # type: ignore[arg-type]
+                          client_ref=uuid4())
+
+
+def test_market_sell_request_rejects_float_qty():
+    """설계서 3.1절: float은 금액 계산에 쓸 수 없다."""
+    with pytest.raises(TypeError, match="qty must be int"):
+        MarketSellRequest(code="005930", qty=100.5, client_ref=uuid4(),  # type: ignore[arg-type]
+                          reason="test")
+
+
+def test_market_sell_request_rejects_bool_qty():
+    """bool은 int의 서브클래스지만 거절한다."""
+    with pytest.raises(TypeError, match="qty must be int"):
+        MarketSellRequest(code="005930", qty=True, client_ref=uuid4(),  # type: ignore[arg-type]
+                          reason="test")
 
 
 def test_balance_qty_of():
