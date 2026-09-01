@@ -53,6 +53,17 @@ class Ladder:
                 "→ 마지막 단계 발동가가 0 이하가 된다"
             )
 
+        # 마지막 단계의 원가(정규화 전)가 1원 이상이어야 한다. 발동가는 단계가
+        # 올라갈수록 낮아지므로 마지막 단계만 검사하면 충분하다. 원가 ≥ 1은
+        # tick_unit(int(원가))이 최소 1원 호가(2,000원 미만)에서 유효하므로
+        # floor 연산이 0을 생산하지 않음을 보장한다.
+        last_raw = Decimal(self.anchor_price) * (Decimal(1) - self.drop_pct * (self.max_stages - 1))
+        if last_raw < Decimal(1):
+            raise LadderConfigError(
+                f"last stage raw trigger price below 1 won: {last_raw} "
+                f"(anchor {self.anchor_price} × (1 - {self.drop_pct} × {self.max_stages - 1}))"
+            )
+
         # 발동가는 단계가 올라갈수록 낮아지므로 1단계에서 1주를 살 수 있으면
         # 모든 단계에서 살 수 있다. 1단계만 검사하면 충분하다.
         first_price = self.trigger_price(1)

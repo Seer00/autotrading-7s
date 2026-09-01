@@ -127,3 +127,54 @@ def test_ladder_is_frozen():
     ladder = make_ladder()
     with pytest.raises(dataclasses.FrozenInstanceError):
         ladder.anchor_price = 1  # type: ignore[misc]
+
+
+def test_rejects_last_stage_raw_price_below_one_won_repro1():
+    """첫 번째 재현: anchor 3, drop 0.4, max_stages 3.
+    Last stage raw: 3*(1-0.4*2)=0.6 → tick_unit(0) 실패."""
+    with pytest.raises(LadderConfigError):
+        make_ladder(anchor_price=3, drop_pct=Decimal("0.4"), max_stages=3, amount_per_stage=3)
+
+
+def test_rejects_last_stage_raw_price_below_one_won_repro2():
+    """두 번째 재현: anchor 10, drop 0.16, max_stages 7.
+    Last stage raw: 10*(1-0.16*6)=0.4 → tick_unit(0) 실패."""
+    with pytest.raises(LadderConfigError):
+        make_ladder(
+            anchor_price=10,
+            drop_pct=Decimal("0.16"),
+            max_stages=7,
+            amount_per_stage=1_000_000,
+        )
+
+
+def test_rejects_realistic_near_limit_case():
+    """현실적 경계값 근처: anchor 1000, drop 0.1666, max_stages 7.
+    Last stage raw: 1000*(1-0.1666*6)=0.004 → tick_unit(0) 실패."""
+    with pytest.raises(LadderConfigError):
+        make_ladder(
+            anchor_price=1_000,
+            drop_pct=Decimal("0.1666"),
+            max_stages=7,
+            amount_per_stage=1_000_000,
+        )
+
+
+def test_accepts_last_stage_raw_price_exactly_one_won():
+    """마지막 단계 원가가 정확히 1원인 경우 구성 성공해야 한다.
+    anchor 10, drop 0.15, max_stages 7 → last raw: 10*(1-0.15*6)=1.0"""
+    ladder = make_ladder(
+        anchor_price=10,
+        drop_pct=Decimal("0.15"),
+        max_stages=7,
+        amount_per_stage=1_000_000,
+    )
+    # Verify it constructs and trigger_price(7) works
+    assert ladder.trigger_price(7) == 1
+
+
+def test_rejects_total_drop_exactly_one_boundary():
+    """drop_pct == 1 / (max_stages - 1) 경계값: total_drop >= 1 검사 대상.
+    drop 0.25, max_stages 5 → total_drop = 0.25 * 4 = 1.0."""
+    with pytest.raises(LadderConfigError):
+        make_ladder(drop_pct=Decimal("0.25"), max_stages=5)
