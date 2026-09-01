@@ -685,6 +685,43 @@ def test_rejects_invalid_drop_pct(drop: Decimal, stages: int):
         make_ladder(drop_pct=drop, max_stages=stages)
 
 
+def test_rejects_total_drop_exactly_one_boundary():
+    """total_drop == 1 경계도 거부한다 (`>=` 비교)."""
+    with pytest.raises(LadderConfigError):
+        make_ladder(drop_pct=Decimal("0.25"), max_stages=5)
+
+
+@pytest.mark.parametrize(
+    ("anchor", "drop", "stages", "amount"),
+    [
+        (3, Decimal("0.4"), 3, 3),                 # 마지막 단계 원시값 0.6
+        (10, Decimal("0.16"), 7, 1_000_000),       # 원시값 0.4
+        (1_000, Decimal("0.1666"), 7, 1_000_000),  # 원시값 0.4 — 현실적 가격대
+    ],
+)
+def test_rejects_last_stage_raw_price_below_one_won(
+    anchor: int, drop: Decimal, stages: int, amount: int
+):
+    """정규화 내림이 0을 만드는 설정은 생성 시점에 거부한다.
+
+    이 가드가 없으면 생성은 성공하고 trigger_price(마지막) 호출이 bare
+    ValueError 로 터진다 — 검증을 통과한 객체가 나중에 터지는 것이다.
+    """
+    with pytest.raises(LadderConfigError, match="below 1 won"):
+        make_ladder(anchor_price=anchor, drop_pct=drop, max_stages=stages,
+                    amount_per_stage=amount)
+
+
+def test_accepts_last_stage_raw_price_exactly_one_won():
+    """경계에서 거부 방향 off-by-one 이 없어야 한다.
+
+    anchor 10 × (1 - 0.15×6) = 10 × 0.10 = 1.0 → 정확히 1원.
+    """
+    ladder = make_ladder(anchor_price=10, drop_pct=Decimal("0.15"), max_stages=7,
+                         amount_per_stage=1_000_000)
+    assert ladder.trigger_price(7) == 1
+
+
 def test_rejects_nonpositive_amounts():
     with pytest.raises(LadderConfigError):
         make_ladder(amount_per_stage=0)
@@ -780,6 +817,23 @@ class Ladder:
             raise LadderConfigError(
                 f"drop_pct {self.drop_pct} × {self.max_stages - 1}단계 = {total_drop} "
                 "→ 마지막 단계 발동가가 0 이하가 된다"
+            )
+
+        # 마지막 단계의 원시 발동가(정규화 전)가 1원 이상이어야 한다.
+        # 위 total_drop 가드는 "수식이 음수가 아님"만 보장하는데, trigger_price 는
+        # normalize_tick 으로 내림하므로 원시값이 (0,1) 구간이면 0으로 내려가고
+        # tick_unit(0) 이 ValueError 를 던진다. 그러면 검증을 통과한 Ladder 가
+        # 호출 시점에 터진다. 원시값 ≥ 1 이면 그 가격대의 호가 단위가 1원이므로
+        # 내림 결과도 ≥ 1 이 보장된다. 발동가는 단계가 올라갈수록 낮아지므로
+        # 마지막 단계만 검사하면 충분하다.
+        last_raw = Decimal(self.anchor_price) * (
+            Decimal(1) - self.drop_pct * (self.max_stages - 1)
+        )
+        if last_raw < Decimal(1):
+            raise LadderConfigError(
+                f"last stage raw trigger price below 1 won: {last_raw} "
+                f"(anchor {self.anchor_price} × (1 - {self.drop_pct} × "
+                f"{self.max_stages - 1}))"
             )
 
         # 발동가는 단계가 올라갈수록 낮아지므로 1단계에서 1주를 살 수 있으면
@@ -3153,6 +3207,7 @@ Plan 1 완료 시 다음이 모두 통과해야 한다.
 - [ ] 규칙 5 — PENDING 제외
 - [ ] 단계 상태 전이 전수 + 불법 전이 거부
 - [ ] 사이클 상태 전이 전수 + 불법 전이 거부
+- [ ] 사다리 설정 검증 — 마지막 단계 원시 발동가 1원 하한(양방향 경계), total_drop == 1 경계
 - [ ] guards 전항목 — 한도 경계값, 1주 미달, 빈도 제한
 - [ ] 평가·실현손익 계산 (설계서 14.1절 목업 수치 고정)
 - [ ] `domain/` 의존 규칙 자동 검증
