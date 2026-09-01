@@ -1,0 +1,24 @@
+[project]
+name = "autotrading7s"
+version = "0.1.0"
+description = "세븐스플릿(7-Split) 자동투자 프로그램 — 키움증권 REST API 기반"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pytest-cov>=5.0"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q --strict-markers"
+
+[tool.coverage.run]
+source = ["autotrading7s.domain"]

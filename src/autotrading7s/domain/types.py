@@ -1,0 +1,144 @@
+"""도메인 어휘 — 열거형과 값 객체.
+
+설계서 3.3절. 이 모듈은 표준 라이브러리 외 어떤 것도 import 하지 않는다.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+from uuid import UUID
+
+
+class Side(Enum):
+    BUY = "BUY"
+    SELL = "SELL"
+
+
+class TickSource(Enum):
+    """시세 출처. WebSocket 끊김 구간을 사후에 식별하기 위해 기록한다."""
+
+    WS = "WS"
+    REST_POLL = "REST_POLL"
+
+
+class OrderPath(Enum):
+    """주문 경로. 자동 판단과 수동 개입을 데이터에 영구 구분한다(설계서 12.2절)."""
+
+    TRIGGER = "TRIGGER"
+    EMERGENCY = "EMERGENCY"
+
+
+class StageStatus(Enum):
+    WAITING = "WAITING"
+    BUY_PENDING = "BUY_PENDING"
+    HOLDING = "HOLDING"
+    SELL_PENDING = "SELL_PENDING"
+    SOLD = "SOLD"
+
+
+class CycleStatus(Enum):
+    IDLE = "IDLE"
+    STARTING = "STARTING"
+    RUNNING = "RUNNING"
+    PAUSED = "PAUSED"
+    LIQUIDATING = "LIQUIDATING"
+    CLOSED = "CLOSED"
+
+
+class CloseReason(Enum):
+    NORMAL = "NORMAL"
+    EMERGENCY = "EMERGENCY"
+
+
+class FillState(Enum):
+    OPEN = "OPEN"
+    PARTIAL = "PARTIAL"
+    FILLED = "FILLED"
+    CANCELED = "CANCELED"
+    REJECTED = "REJECTED"
+
+
+@dataclass(frozen=True, slots=True)
+class Tick:
+    code: str
+    price: int
+    at: datetime
+    source: TickSource
+
+
+@dataclass(frozen=True, slots=True)
+class LimitOrderRequest:
+    """자동 트리거 경로 전용 주문 요청.
+
+    설계서 6절·8.2절: 신용·미수 필드가 존재하지 않으며, ``price`` 가 필수이므로
+    시장가를 표현할 방법이 없다. 원칙을 문서가 아니라 타입으로 강제한다.
+    """
+
+    code: str
+    side: Side
+    qty: int
+    price: int
+    client_ref: UUID
+
+    def __post_init__(self) -> None:
+        if self.qty <= 0:
+            raise ValueError(f"qty must be positive: {self.qty}")
+        if self.price <= 0:
+            raise ValueError(f"price must be positive: {self.price}")
+
+
+@dataclass(frozen=True, slots=True)
+class MarketSellRequest:
+    """긴급청산 경로 전용 주문 요청.
+
+    ``reason`` 은 필수 필드다. 사용자 입력 자체는 선택이므로 빈 문자열을
+    허용하지만, 필드가 필수여서 사유 기록을 구조적으로 빼먹을 수 없다.
+    """
+
+    code: str
+    qty: int
+    client_ref: UUID
+    reason: str
+
+    def __post_init__(self) -> None:
+        if self.qty <= 0:
+            raise ValueError(f"qty must be positive: {self.qty}")
+
+
+@dataclass(frozen=True, slots=True)
+class OrderAck:
+    client_ref: UUID
+    broker_order_id: str
+    accepted_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class OrderStatus:
+    client_ref: UUID
+    broker_order_id: str
+    state: FillState
+    filled_qty: int
+    filled_price: int | None
+    api_code: str | None = None
+    api_message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Holding:
+    code: str
+    qty: int
+    avg_price: int
+
+
+@dataclass(frozen=True, slots=True)
+class Balance:
+    cash: int
+    holdings: tuple[Holding, ...]
+
+    def qty_of(self, code: str) -> int:
+        for holding in self.holdings:
+            if holding.code == code:
+                return holding.qty
+        return 0
