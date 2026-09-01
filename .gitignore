@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# 로컬 데이터 (모의/실전 DB, 로그)
+data/
+*.db
+*.db-journal
+logs/
+
+# 자격증명 — keyring에 저장하며 파일로 남기지 않음
+.env
+*.secret
+
+# 세션 히스토리 (도구가 관리)
+.remember/
