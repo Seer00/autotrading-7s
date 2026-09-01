@@ -145,3 +145,72 @@ def test_state_is_frozen():
 
     with pytest.raises(dataclasses.FrozenInstanceError):
         waiting().status = StageStatus.HOLDING  # type: ignore[misc]
+
+
+def test_holding_requires_fill_information():
+    """HOLDING 상태는 체결가와 수량이 모두 있어야 한다."""
+    with pytest.raises(ValueError, match="fill_price must be positive"):
+        StageState(
+            stage_no=2, status=StageStatus.HOLDING, trigger_price=9_500,
+            planned_qty=105, fill_price=None, fill_qty=105,
+        )
+
+    with pytest.raises(ValueError, match="fill_qty must be positive"):
+        StageState(
+            stage_no=2, status=StageStatus.HOLDING, trigger_price=9_500,
+            planned_qty=105, fill_price=9_480, fill_qty=None,
+        )
+
+
+def test_sell_pending_requires_fill_information():
+    """SELL_PENDING 상태도 체결가와 수량이 모두 있어야 한다."""
+    with pytest.raises(ValueError, match="fill_price must be positive"):
+        StageState(
+            stage_no=2, status=StageStatus.SELL_PENDING, trigger_price=9_500,
+            planned_qty=105, fill_price=None, fill_qty=105,
+        )
+
+    with pytest.raises(ValueError, match="fill_qty must be positive"):
+        StageState(
+            stage_no=2, status=StageStatus.SELL_PENDING, trigger_price=9_500,
+            planned_qty=105, fill_price=9_480, fill_qty=None,
+        )
+
+
+def test_holding_rejects_zero_or_negative_fill():
+    """HOLDING 상태에서 체결가 또는 수량이 0 이하면 거부."""
+    with pytest.raises(ValueError, match="fill_price must be positive"):
+        StageState(
+            stage_no=2, status=StageStatus.HOLDING, trigger_price=9_500,
+            planned_qty=105, fill_price=0, fill_qty=105,
+        )
+
+    with pytest.raises(ValueError, match="fill_qty must be positive"):
+        StageState(
+            stage_no=2, status=StageStatus.HOLDING, trigger_price=9_500,
+            planned_qty=105, fill_price=9_480, fill_qty=0,
+        )
+
+
+def test_non_holding_statuses_allow_no_fill():
+    """WAITING, BUY_PENDING, SOLD 상태는 체결 정보 없이 구성 가능."""
+    # WAITING
+    st = StageState(
+        stage_no=2, status=StageStatus.WAITING, trigger_price=9_500,
+        planned_qty=105,
+    )
+    assert st.fill_price is None and st.fill_qty is None
+
+    # BUY_PENDING
+    st = StageState(
+        stage_no=2, status=StageStatus.BUY_PENDING, trigger_price=9_500,
+        planned_qty=105,
+    )
+    assert st.fill_price is None and st.fill_qty is None
+
+    # SOLD
+    st = StageState(
+        stage_no=2, status=StageStatus.SOLD, trigger_price=9_500,
+        planned_qty=105,
+    )
+    assert st.fill_price is None and st.fill_qty is None

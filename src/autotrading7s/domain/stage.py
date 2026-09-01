@@ -50,6 +50,30 @@ class StageState:
             return self.fill_qty or 0
         return 0
 
+    def __post_init__(self) -> None:
+        """주식 보유 상태는 체결가와 수량이 함께 있어야 한다.
+
+        이 검증은 두 계층으로 이루어진다:
+        1. to_holding() 은 전이 문맥에서 유효성을 검사한다 (전이 실패 메시지)
+        2. __post_init__() 은 타입의 불변식을 강제한다 (타입 안정성)
+        두 계층의 중복은 의도적이며, dataclasses.replace() 호출이 __init__을 거치므로
+        모든 전이도 이 검증을 통과한다.
+
+        Plan 2에서 SQLite 행 재구성 시 부분 정보(예: fill_qty NULL)는 정확히
+        이 불변식을 위반한다. 따라서 경계에서의 보호가 필수다.
+        """
+        if self.status in (StageStatus.HOLDING, StageStatus.SELL_PENDING):
+            if self.fill_price is None or self.fill_price <= 0:
+                raise ValueError(
+                    f"status {self.status.value}: fill_price must be positive, "
+                    f"got {self.fill_price}"
+                )
+            if self.fill_qty is None or self.fill_qty <= 0:
+                raise ValueError(
+                    f"status {self.status.value}: fill_qty must be positive, "
+                    f"got {self.fill_qty}"
+                )
+
 
 def _guard(state: StageState, to: StageStatus) -> None:
     if to not in _ALLOWED[state.status]:
