@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from autotrading7s.domain.stage import (
+    IllegalStageTransition,
+    StageState,
+    after_sell,
+    cancel_buy,
+    cancel_sell,
+    force_sold,
+    to_buy_pending,
+    to_holding,
+    to_sell_pending,
+)
+from autotrading7s.domain.types import StageStatus
+
+T0 = datetime(2026, 9, 1, 9, 30, tzinfo=timezone.utc)
+
+
+def waiting(stage_no: int = 2) -> StageState:
+    return StageState(
+        stage_no=stage_no,
+        status=StageStatus.WAITING,
+        trigger_price=9_500,
+        planned_qty=105,
+    )
+
+
+def holding() -> StageState:
+    return to_holding(to_buy_pending(waiting()), fill_price=9_480, fill_qty=105, at=T0)
+
+
+def test_happy_path_buy_then_sell_with_rebuy():
+    st = waiting()
+    assert st.held_qty == 0
+
+    st = to_buy_pending(st)
+    assert st.status is StageStatus.BUY_PENDING
+    assert st.held_qty == 0, "PENDING 중에는 보유수량으로 세지 않는다"
+
+    st = to_holding(st, fill_price=9_480, fill_qty=105, at=T0)
+    assert st.status is StageStatus.HOLDING
+    assert (st.fill_price, st.fill_qty, st.bought_at) == (9_480, 105, T0)
+    assert st.held_qty == 105
+
+    st = to_sell_pending(st)
+    assert st.status is StageStatus.SELL_PENDING
+    assert st.held_qty == 105, "매도 체결 전까지는 여전히 보유"
+
+    sold_at = T0 + timedelta(minutes=10)
+    st = after_sell(st, at=sold_at, allow_rebuy=True)
+    assert st.status is StageStatus.WAITING
+    assert st.last_sold_at == sold_at
+    assert st.rebuy_count == 1
+    assert st.fill_price is None and st.fill_qty is None
+    assert st.held_qty == 0
+    assert st.trigger_price == 9_500, "발동가는 사다리에 고정되어 변하지 않는다"
+
+
+def test_after_sell_without_rebuy_is_terminal():
+    st = after_sell(to_sell_pending(holding()), at=T0, allow_rebuy=False)
+    assert st.status is StageStatus.SOLD
+    assert st.rebuy_count == 0
+    with pytest.raises(IllegalStageTransition):
+        to_buy_pending(st)
+
+
+def test_cancel_buy_returns_to_waiting():
+    st = cancel_buy(to_buy_pending(waiting()))
+    assert st.status is StageStatus.WAITING
+    assert st.fill_price is None
+
+
+def test_cancel_sell_returns_to_holding():
+    """매도 주문이 체결 없이 취소되면 보유로 되돌아간다."""
+    st = cancel_sell(to_sell_pending(holding()))
+    assert st.status is StageStatus.HOLDING
+    assert st.held_qty == 105
+
+
+def test_partial_buy_fill_confirms_with_filled_quantity_only():
+    """설계서 4.1절: 매수 부분체결은 체결 수량만으로 HOLDING 확정."""
+    st = to_holding(to_buy_pending(waiting()), fill_price=9_480, fill_qty=60, at=T0)
+    assert st.status is StageStatus.HOLDING
+    assert st.fill_qty == 60
+    assert st.planned_qty == 105, "계획 수량은 기록으로 남는다"
+
+
+@pytest.mark.parametrize(
+    ("from_status", "action"),
+    [
+        (StageStatus.WAITING, "to_holding"),
+        (StageStatus.WAITING, "to_sell_pending"),
+        (StageStatus.WAITING, "cancel_buy"),
+        (StageStatus.BUY_PENDING, "to_buy_pending"),
+        (StageStatus.BUY_PENDING, "to_sell_pending"),
+        (StageStatus.HOLDING, "to_buy_pending"),
+        (StageStatus.HOLDING, "to_holding"),
+        (StageStatus.SELL_PENDING, "to_sell_pending"),
+        (StageStatus.SOLD, "to_sell_pending"),
+        (StageStatus.SOLD, "cancel_buy"),
+    ],
+)
+def test_illegal_transitions_are_rejected(from_status: StageStatus, action: str):
+    st = StageState(
+        stage_no=2, status=from_status, trigger_price=9_500, planned_qty=105,
+        fill_price=9_480, fill_qty=105,
+    )
+    fn = {
+        "to_buy_pending": lambda s: to_buy_pending(s),
+        "to_holding": lambda s: to_holding(s, fill_price=1, fill_qty=1, at=T0),
+        "to_sell_pending": lambda s: to_sell_pending(s),
+        "cancel_buy": lambda s: cancel_buy(s),
+    }[action]
+    with pytest.raises(IllegalStageTransition):
+        fn(st)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [StageStatus.WAITING, StageStatus.BUY_PENDING, StageStatus.HOLDING,
+     StageStatus.SELL_PENDING],
+)
+def test_force_sold_bypasses_transition_table(status: StageStatus):
+    """긴급청산은 Trigger Engine을 우회하는 별도 경로다 (설계서 11.1절)."""
+    st = StageState(stage_no=3, status=status, trigger_price=9_000, planned_qty=111,
+                    fill_price=8_950, fill_qty=111)
+    forced = force_sold(st, at=T0)
+    assert forced.status is StageStatus.SOLD
+    assert forced.last_sold_at == T0
+    assert forced.held_qty == 0
+
+
+def test_force_sold_on_already_sold_is_idempotent():
+    st = StageState(stage_no=3, status=StageStatus.SOLD, trigger_price=9_000,
+                    planned_qty=111)
+    assert force_sold(st, at=T0).status is StageStatus.SOLD
+
+
+def test_state_is_frozen():
+    import dataclasses
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        waiting().status = StageStatus.HOLDING  # type: ignore[misc]
