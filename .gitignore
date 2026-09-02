@@ -20,3 +20,7 @@ logs/
 
 # SDD 워크스페이스 (스크래치)
 .superpowers/
+
+# 커버리지 산출물
+.coverage
+htmlcov/
