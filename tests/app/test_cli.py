@@ -107,3 +107,36 @@ def test_status_mode_is_off_by_default(tmp_path, capsys):
                      "--db", str(db), "--simulate", "10000,9500"])
     assert code == 0
     assert "보유현황" not in capsys.readouterr().out
+
+
+def test_module_is_runnable_as_a_script(tmp_path):
+    """`python -m autotrading7s.cli` 가 실제로 `main()` 을 부른다.
+
+    이 파일의 다른 모든 테스트는 `cli.main()` 을 직접 부른다. 그러면 진입점
+    가드가 없어도 전부 통과하고, **문서와 체크리스트가 안내하는 명령은
+    아무것도 하지 않은 채 종료 코드 0 을 낸다.** 사용자는 그것을 "보유가
+    없다" 로 오해한다 — 실패보다 나쁜 침묵이며, 체크리스트 21번(두 렌더러의
+    대조)은 그 명령에 전부 의존한다.
+
+    하위 프로세스로 도는 유일한 테스트이므로 어댑터 부재 경로를 쓴다 —
+    시세 스크립트가 필요 없고 표준오류에 반드시 무언가를 찍는다.
+    """
+    import os
+    import subprocess
+    import sys
+
+    settings = tmp_path / "settings.toml"
+    settings.write_text("[engine]\ntotal_limit = 1000000\n", encoding="utf-8")
+    # 환경을 새로 짜지 않고 물려받은 것을 덮어쓴다 — 최소 환경을 손으로
+    # 만들면 Windows 에서 깨진다(`SYSTEMROOT` 가 없으면 소켓 초기화가
+    # 실패한다). 이 테스트가 지키려는 명령이 정작 Windows 에서 돌아야 한다.
+    env = {**os.environ, "PYTHONPATH": str(Path(cli.__file__).resolve().parents[1]),
+           "PYTHONIOENCODING": "utf-8"}
+    proc = subprocess.run(
+        [sys.executable, "-m", "autotrading7s.cli", "--env", "real",
+         "--settings", str(settings), "--db", str(tmp_path / "real.db")],
+        capture_output=True, text=True, timeout=60, env=env,
+    )
+    assert proc.returncode == 2, (
+        f"진입점 가드가 없으면 종료 코드 0 이다: {proc!r}")
+    assert "키움" in proc.stderr

@@ -133,3 +133,12 @@ def main(argv: list[str] | None = None) -> int:
 
     asyncio.run(run())
     return 0
+
+
+if __name__ == "__main__":
+    # `python -m autotrading7s.cli` 가 실제로 `main()` 을 부르게 만든다.
+    # 이 블록이 없으면 모듈이 import 되고 `main` 이 정의된 채 종료 코드 0 으로
+    # 끝난다 — 아무것도 하지 않았는데 성공으로 보이는 침묵이며, 설계서 14.4
+    # 절의 headless 경로와 Plan 4 체크리스트 21번(두 렌더러의 대조)이 전부
+    # 이 명령에 의존한다.
+    raise SystemExit(main())
