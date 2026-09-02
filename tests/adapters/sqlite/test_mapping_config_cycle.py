@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -130,8 +131,18 @@ def test_cycle_round_trip_idle_with_no_anchor():
     assert restored.anchor_price is None and restored.ladder is None
 
 
-def test_cycle_round_trip_closed_forced():
-    """D20 — 강제 종료의 증언과 잔량이 왕복해야 한다."""
+def test_cycle_round_trip_closed_forced_restores_status_and_reason_only():
+    """D20 — FORCED 행에서 왕복하는 것은 `status` 와 `close_reason` 뿐이다.
+
+    이 테스트는 이전에 "강제 종료의 증언과 잔량이 왕복해야 한다" 는 이름과
+    문서를 달고 있었지만, 실제로는 `status`·`close_reason` 만 확인했다 —
+    증언(`forced_close_reason`)도 잔량(`forced_close_qty`)도 보지 않았다.
+    실제로 그 둘은 왕복하지 않는다: `Cycle` 에 그 값을 담을 필드가 없다
+    (`cycle_to_row` 도 그 두 컬럼을 다루지 않는다). 아래는 그 부재 자체를
+    고정한다 — Plan 2B 가 D20 의 강제 종료 전이를 추가할 때 `Cycle` 에 필드를
+    얹으면 이 assert 가 실패로 알려준다(이름을 바꿔 실제로 왕복하는지
+    검증하는 테스트로 승격해야 한다는 신호다).
+    """
     lad = a_ladder()
     row = cycle_to_row(
         Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.RUNNING,
@@ -144,6 +155,12 @@ def test_cycle_round_trip_closed_forced():
     restored = row_to_cycle(row)
     assert restored.status is CycleStatus.CLOSED
     assert restored.close_reason is CloseReason.FORCED
+    # Cycle 은 D20 의 증언·잔량을 담을 필드가 없다 — 그래서 위 두 assert
+    # 만으로는 그 두 컬럼이 왕복하는지 알 수 없다. 여기서 그 부재를 직접
+    # 확인한다: 필드가 생기면 이 assert 가 실패해 회귀를 알려준다.
+    cycle_fields = {f.name for f in dataclasses.fields(Cycle)}
+    assert "forced_close_reason" not in cycle_fields
+    assert "forced_close_qty" not in cycle_fields
 
 
 def test_row_to_cycle_wraps_an_anchor_ladder_mismatch():

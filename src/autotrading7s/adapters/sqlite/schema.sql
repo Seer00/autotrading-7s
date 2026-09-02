@@ -142,5 +142,10 @@ FROM stage_state ss
 JOIN cycle cy         ON cy.id  = ss.cycle_id
 JOIN split_config cfg ON cfg.id = cy.config_id
 WHERE ss.status IN ('HOLDING', 'SELL_PENDING')
+  -- CLOSED 사이클은 제외한다. D20 강제 종료는 사이클을 CLOSED 로 만들면서도
+  -- stage_state 를 HOLDING 으로 남길 수 있다(잔량을 실제로 못 정리했으므로) —
+  -- 그 잔량은 이 뷰가 아니라 emergency_liquidation_log.qty_after 에 남는다.
+  -- 사용자가 실제로 들고 있는 주식이 이 뷰에서 조용히 빠지는 경우이므로
+  -- 지우지 않는다.
   AND cy.status != 'CLOSED'
 GROUP BY cy.id;

@@ -170,6 +170,28 @@ def test_holdings_counts_sell_pending_as_held():
     conn.close()
 
 
+def test_holdings_excludes_a_closed_cycle_even_with_holding_stages(repo):
+    """Fix Round 3, Finding 9 — CLOSED 사이클은 stage_state 가 여전히
+    HOLDING 이어도 holdings() 에서 빠져야 한다.
+
+    이것은 D20 강제 종료의 잔량 경우이기도 하다 — 거래정지 등으로 정상
+    청산이 불가능해 사이클이 CLOSED 로 강제 종료됐지만 주식은 실제로 남아
+    있을 수 있다. 그 잔량은 이 뷰가 아니라
+    emergency_liquidation_log.qty_after 에 기록된다(schema.sql 의 holdings
+    뷰 주석 참고) — 사용자가 실제로 들고 있는 주식이 이 뷰에서는 조용히
+    빠지는, 의도된 경우다.
+
+    G2a 게이트의 `assert repo.holdings() == []` 는 이 경로를 구분하지
+    못한다 — 그 시점엔 단계가 전부 SOLD 이기도 해서, status 조건 하나만으로
+    이미 빈 결과가 나온다. 여기서는 status 를 HOLDING 으로 둔 채 cycle 만
+    CLOSED 로 만들어 status != 'CLOSED' 조건 자체를 검사한다."""
+    cycle_id = seed(repo, holdings=[(1, 10_000, 100)])
+    repo._conn.execute(  # noqa: SLF001 — CLOSED 강제 종료를 직접 시뮬레이션
+        "UPDATE cycle SET status = 'CLOSED' WHERE id = ?", (cycle_id,))
+    repo._conn.commit()
+    assert repo.holdings() == []
+
+
 def test_holdings_lists_multiple_stocks():
     conn = connect(":memory:")
     apply_schema(conn)
