@@ -15,6 +15,10 @@ logs/
 .env
 *.secret
 
+# 사용자별 엔진 설정. 추적하는 것은 settings.example.toml 뿐이다 —
+# total_limit 은 사람마다 다르고, 남의 한도가 기본값처럼 딸려오면 위험하다.
+settings.toml
+
 # 세션 히스토리 (도구가 관리)
 .remember/
 

@@ -73,3 +73,23 @@ def test_load_settings_requires_total_limit(tmp_path: Path):
     path.write_text("[engine]\npending_timeout_sec = 3\n", encoding="utf-8")
     with pytest.raises(ValueError, match="total_limit"):
         load_settings(path)
+
+
+def test_the_example_settings_file_is_valid():
+    """`settings.example.toml` 이 실제로 로드된다.
+
+    예시 파일은 썩는다 — 필드 이름이 바뀌거나 키가 추가되면 조용히 무효가
+    되고, 그것을 발견하는 사람은 저장소를 클론해 처음 돌려보는 사람이다.
+    `load_settings` 가 알 수 없는 키를 거부하므로 이 테스트가 이름 변경까지
+    잡는다.
+
+    README 가 `--settings settings.toml` 을 안내하므로 이 파일이 그 형식의
+    유일한 문서다.
+    """
+    root = Path(__file__).resolve().parents[2]
+    example = root / "settings.example.toml"
+    assert example.exists(), "README 가 안내하는 설정 형식의 예시가 없다"
+    settings = load_settings(example)
+    # 총한도는 설계서 6절이 요구하는 유일한 구조적 보호장치다 — 예시가
+    # 그것을 비워두면 복사한 사람이 한도 없이 돌린다.
+    assert settings.total_limit > 0
