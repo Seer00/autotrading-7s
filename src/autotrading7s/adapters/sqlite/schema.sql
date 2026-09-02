@@ -1,11 +1,11 @@
 -- AutoTrading 7s 스키마 v1 — 설계서 12절
 -- 비율은 TEXT(Decimal 문자열), 시각은 TEXT(ISO 8601, tz-aware 필수).
 
-CREATE TABLE schema_version (
+CREATE TABLE IF NOT EXISTS schema_version (
   version INTEGER NOT NULL
 );
 
-CREATE TABLE split_config (
+CREATE TABLE IF NOT EXISTS split_config (
   id INTEGER PRIMARY KEY,
   stock_code TEXT NOT NULL,
   stock_name TEXT,
@@ -23,7 +23,7 @@ CREATE TABLE split_config (
   UNIQUE(stock_code, label)
 );
 
-CREATE TABLE cycle (
+CREATE TABLE IF NOT EXISTS cycle (
   id INTEGER PRIMARY KEY,
   config_id INTEGER NOT NULL REFERENCES split_config(id),
   seq INTEGER NOT NULL CHECK(seq >= 1),
@@ -44,7 +44,7 @@ CREATE TABLE cycle (
         OR (forced_close_reason IS NOT NULL AND forced_close_qty IS NOT NULL))
 );
 
-CREATE TABLE stage_state (
+CREATE TABLE IF NOT EXISTS stage_state (
   id INTEGER PRIMARY KEY,
   cycle_id INTEGER NOT NULL REFERENCES cycle(id),
   stage_no INTEGER NOT NULL CHECK(stage_no BETWEEN 1 AND 7),
@@ -63,7 +63,7 @@ CREATE TABLE stage_state (
         OR (fill_price IS NOT NULL AND fill_qty IS NOT NULL))
 );
 
-CREATE TABLE order_log (
+CREATE TABLE IF NOT EXISTS order_log (
   id INTEGER PRIMARY KEY,
   client_ref TEXT NOT NULL UNIQUE,
   cycle_id INTEGER NOT NULL REFERENCES cycle(id),
@@ -89,10 +89,10 @@ CREATE TABLE order_log (
   CHECK(path IS NOT 'TRIGGER' OR order_type = 'LIMIT')
 );
 
-CREATE INDEX idx_order_log_cycle ON order_log(cycle_id);
-CREATE INDEX idx_order_log_status ON order_log(status);
+CREATE INDEX IF NOT EXISTS idx_order_log_cycle ON order_log(cycle_id);
+CREATE INDEX IF NOT EXISTS idx_order_log_status ON order_log(status);
 
-CREATE TABLE emergency_liquidation_log (
+CREATE TABLE IF NOT EXISTS emergency_liquidation_log (
   id INTEGER PRIMARY KEY,
   scope TEXT NOT NULL CHECK(scope IN ('SINGLE', 'ALL')),
   stock_code TEXT,
@@ -108,7 +108,7 @@ CREATE TABLE emergency_liquidation_log (
   completed_at TEXT
 );
 
-CREATE TABLE token_session (
+CREATE TABLE IF NOT EXISTS token_session (
   id INTEGER PRIMARY KEY,
   env TEXT NOT NULL CHECK(env IN ('MOCK', 'REAL')),
   app_key_hash TEXT NOT NULL,
@@ -116,7 +116,7 @@ CREATE TABLE token_session (
   expires_at TEXT NOT NULL
 );
 
-CREATE TABLE reconcile_log (
+CREATE TABLE IF NOT EXISTS reconcile_log (
   id INTEGER PRIMARY KEY,
   checked_at TEXT NOT NULL,
   stock_code TEXT NOT NULL,
@@ -128,7 +128,7 @@ CREATE TABLE reconcile_log (
 );
 
 -- 설계서 12.3절. 현재가·평가손익은 실시간 값이므로 뷰에 담지 않는다.
-CREATE VIEW holdings AS
+CREATE VIEW IF NOT EXISTS holdings AS
 SELECT cfg.stock_code,
        cfg.stock_name,
        cfg.label,

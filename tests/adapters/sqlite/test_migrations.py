@@ -4,6 +4,7 @@ import sqlite3
 
 import pytest
 
+from autotrading7s.adapters.sqlite import migrations as migrations_module
 from autotrading7s.adapters.sqlite.migrations import (
     SCHEMA_VERSION,
     apply_schema,
@@ -117,3 +118,29 @@ def test_token_session_stores_no_token(conn):
     }
     assert "token_enc" not in cols and "token" not in cols
     assert {"env", "app_key_hash", "issued_at", "expires_at"} <= cols
+
+
+def test_apply_schema_recovers_after_crash_between_ddl_and_version_write():
+    """DDL 이 끝난 뒤, 버전 기록 전에 죽어도 다음 기동이 DB 를 못 쓰게 만들면 안 된다.
+
+    executescript() 는 자신의 DDL 을 `with conn:` 의 커밋/롤백 범위 밖에서 즉시
+    커밋한다. 그래서 스키마가 이미 만들어졌지만 schema_version 행이 아직 없는
+    상태로 프로세스가 죽는 크래시 윈도우가 있다 — 여기서 재현한다. 이전에는 다음
+    apply_schema() 호출이 `CREATE TABLE` 에서 "table already exists" 로 죽어
+    사용자의 유일한 해결책이 DB 파일 삭제(거래 기록 손실)였다. `IF NOT EXISTS`
+    가 이를 고친다.
+    """
+    conn = connect(":memory:")
+    schema_sql = migrations_module._SCHEMA_PATH.read_text(encoding="utf-8")
+    conn.executescript(schema_sql)  # DDL 만 실행 — 버전 행은 아직 없다
+
+    # 크래시로 반쪽만 적용된 상태를 재확인
+    row = conn.execute("SELECT COUNT(*) AS n FROM schema_version").fetchone()
+    assert row["n"] == 0
+
+    assert apply_schema(conn) == SCHEMA_VERSION
+
+    rows = conn.execute("SELECT version FROM schema_version").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["version"] == SCHEMA_VERSION
+    conn.close()

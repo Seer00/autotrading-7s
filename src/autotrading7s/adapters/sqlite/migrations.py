@@ -47,10 +47,12 @@ def apply_schema(conn: sqlite3.Connection) -> int:
             f"DB schema version {current} is newer than this program's "
             f"{SCHEMA_VERSION} — refusing to touch it"
         )
-    # executescript() 는 실행 전에 보류 중인 트랜잭션을 암묵적으로 커밋하고,
-    # 스크립트의 DDL 은 `with conn:` 의 커밋/롤백 범위 밖에서 즉시 반영된다
-    # (직접 실험으로 확인함 — 보고서 참고). 그래도 정상 경로에서는 두 statement
-    # 를 하나의 `with conn:` 로 묶어 버전 기록의 원자성을 표현한다.
+    # executescript() 는 스크립트의 DDL 을 `with conn:` 의 커밋/롤백 범위 밖에서
+    # 즉시 커밋한다 — 그래서 여기서는 원자성을 표현할 수 없다(직접 실험으로 확인:
+    # executescript() 이후 예외를 던져도 이미 만들어진 테이블은 롤백되지 않는다).
+    # 대신 schema.sql 의 모든 DDL 문이 `IF NOT EXISTS` 이므로, 스키마 적용과 버전
+    # 기록 사이의 어느 지점에서 죽어도 다음 apply_schema() 호출이 남은 부분만
+    # 채우며 안전하게 재실행된다.
     with conn:  # 전체를 한 트랜잭션으로
         conn.executescript(_SCHEMA_PATH.read_text(encoding="utf-8"))
         conn.execute("DELETE FROM schema_version")
