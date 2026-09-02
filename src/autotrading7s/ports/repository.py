@@ -10,15 +10,27 @@ tz-aware datetime)을 강제하는 지점이다.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Protocol, runtime_checkable
 
 from autotrading7s.domain.cycle import Cycle
+from autotrading7s.domain.errors import DomainInvariantError
 from autotrading7s.domain.ladder import Ladder
 from autotrading7s.domain.stage import StageState
 from autotrading7s.domain.types import CycleStatus, OrderPath, Side
+
+
+class CorruptRowError(DomainInvariantError):
+    """저장된 행에서 도메인 객체를 복원할 수 없다 — 테이블과 rowid 를 지목한다.
+
+    호출자 버그(`TypeError`)와 구분되며, 엔진이 이것을 잡아 그 사이클만
+    격리한다. 예외를 포트에 두는 이유는 브로커 예외와 같다: `engine/` 은
+    `adapters/` 를 알지 못하므로, 예외가 어댑터에만 있으면 엔진은 넓은
+    `except ValueError` 를 쓰게 되고 그것은 DB 손상을 삼킨다 (2A 핸드오버 7).
+    """
 
 
 class OrderLogNotFound(LookupError):
@@ -166,6 +178,10 @@ class PendingOrderRow:
     fill_qty: int | None
     status: str
     sent_at: datetime
+    # 단계 번호. `stage_state_id` 만으로는 어느 단계인지 알 수 없고, 소비자
+    # (재시작 복구와 미체결 감시)가 전부 그것을 필요로 한다. 긴급청산 주문은
+    # 단계에 붙지 않으므로 `None` 이다.
+    stage_no: int | None = None
 
 
 @runtime_checkable
@@ -231,6 +247,15 @@ class RepositoryPort(Protocol):
         """
         ...
 
+    def stage_row_id(self, cycle_id: int, stage_no: int) -> int:
+        """`stage_state` 행의 id. 없으면 `RowNotFound`.
+
+        `order_log.stage_state_id` 를 채우기 위해 필요하다. 이 연결이 없으면
+        재시작 복구가 미체결 주문이 어느 단계의 것인지 알 수 없고, 설계서
+        10.1절 2단계('체결됨 → HOLDING 으로 정정')를 수행할 방법이 없다.
+        """
+        ...
+
     def save_stage(self, cycle_id: int, stage: StageState) -> None:
         """(cycle_id, stage_no) 로 upsert 한다.
 
@@ -241,6 +266,33 @@ class RepositoryPort(Protocol):
         전이에서든 증가시키거나), 도메인 전이표가 허용하지 않는 상태로
         옮기려 할 때. 같은 상태로의 재저장(매 틱의 정상 흐름)과 같은 값의
         재확인은 허용한다.
+        """
+        ...
+
+    def emergency_close_cycle(
+        self, *, cycle: Cycle, stages: Sequence[StageState]
+    ) -> None:
+        """긴급청산·강제 종료의 원자적 쓰기 — 설계서 11.1절 ⑤⑦, 11.4절 ⑤⑥.
+
+        `close_reason` 이 `EMERGENCY` 이거나 `FORCED` 인 사이클만 받는다.
+        정상 종료는 이 문을 쓸 수 없다 — 정상 경로는 `save_stage` 의 가드와
+        `close()` 의 보유 0 검사를 통과해야 한다.
+
+        `save_stage` 를 쓰지 않는 이유: `force_sold` 는 전이표를 의도적으로
+        우회하는데 `save_stage` 의 가드는 그 표를 참조한다. 우회 플래그를 두면
+        가드가 막고 있는 모든 것(체결값 덮어쓰기, 상태 역행)이 그 문으로
+        들어온다. 그래서 전용 경로를 두고 입력을 엄격히 검사한다.
+
+        원자적이어야 하는 이유: 절반만 청산된 상태 — 사이클은 CLOSED 인데
+        단계가 HOLDING 으로 남거나 그 반대 — 는 어느 경로로도 정리할 수 없다.
+        """
+        ...
+
+    def set_realized_pnl(self, cycle_id: int, value: int) -> None:
+        """사이클 종료 시 `realized_pnl_for_cycle` 의 값을 기록한다.
+
+        `cycle_to_row` 가 이 컬럼을 의도적으로 제외하므로(도메인 `Cycle` 에
+        그 필드가 없다) 전용 경로가 필요하다.
         """
         ...
 
@@ -307,6 +359,20 @@ class RepositoryPort(Protocol):
         self, *, checked_at: datetime, stock_code: str, internal_qty: int,
         broker_qty: int, verdict: str, action_taken: str | None,
     ) -> int: ...
+
+    def forced_close_baseline(self, stock_code: str) -> int:
+        """이 종목에서 강제 종료된 누적 수량 — 마지막 기준선 초기화 이후만.
+
+        설계서 11.4절: 강제 종료된 수량을 대사 기준에서 제외해야 하고, 그
+        제외는 영구적이지 않아야 한다.
+        """
+        ...
+
+    def reset_forced_close_baseline(
+        self, stock_code: str, *, at: datetime
+    ) -> None:
+        """사용자가 남은 주식을 처리했다고 알린 시점을 기록한다 (설계서 11.4절)."""
+        ...
 
     # ── 보유현황 뷰 ─────────────────────────────────────────────────────
     def holdings(self) -> list[HoldingRow]:

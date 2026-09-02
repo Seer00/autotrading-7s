@@ -14,6 +14,7 @@ SQL 과 트랜잭션 경계만 다룬다.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Sequence
 from datetime import datetime
 
 from autotrading7s.adapters.sqlite.codec import dt_to_text, text_to_dt
@@ -37,7 +38,13 @@ from autotrading7s.ports.repository import (
 from autotrading7s.domain.cycle import Cycle
 from autotrading7s.domain.stage import StageState
 from autotrading7s.domain.stage import _ALLOWED as _STAGE_TRANSITIONS
-from autotrading7s.domain.types import CycleStatus, OrderPath, Side, StageStatus
+from autotrading7s.domain.types import (
+    CloseReason,
+    CycleStatus,
+    OrderPath,
+    Side,
+    StageStatus,
+)
 
 
 class SqliteRepository:
@@ -154,6 +161,23 @@ class SqliteRepository:
             [dict(r) for r in rows], cycle_id=cycle_id, ladder=cycle.ladder
         )
 
+    def stage_row_id(self, cycle_id: int, stage_no: int) -> int:
+        """`stage_state` 행의 id — `order_log.stage_state_id` 를 채우는 데 쓴다.
+
+        사이클로 범위를 좁히는 것이 중요하다. `UNIQUE(cycle_id, stage_no)` 가
+        있으므로 두 열이 함께여야 행 하나를 지목하며, `stage_no` 만으로 찾으면
+        다른 사이클의 단계에 주문이 붙는다.
+        """
+        row = self._conn.execute(
+            "SELECT id FROM stage_state WHERE cycle_id = ? AND stage_no = ?",
+            (cycle_id, stage_no),
+        ).fetchone()
+        if row is None:
+            raise RowNotFound(
+                f"no stage_state row for cycle_id={cycle_id} stage_no={stage_no}"
+            )
+        return int(dict(row)["id"])
+
     def save_stage(self, cycle_id: int, stage: StageState) -> None:
         """(cycle_id, stage_no) 로 upsert. 없는 행이면 그냥 만든다(초기 저장).
 
@@ -248,6 +272,96 @@ class SqliteRepository:
                 f"ON CONFLICT(cycle_id, stage_no) DO UPDATE SET {updates}",
                 row,
             )
+
+    def emergency_close_cycle(
+        self, *, cycle: Cycle, stages: Sequence[StageState]
+    ) -> None:
+        """긴급청산·강제 종료의 원자적 쓰기 — 설계서 11.1절 ⑤⑦, 11.4절 ⑤⑥.
+
+        `close_reason` 이 `EMERGENCY` 이거나 `FORCED` 인 사이클만 받는다.
+        정상 종료는 이 문을 쓸 수 없다 — 정상 경로는 `save_stage` 의 가드와
+        `close()` 의 보유 0 검사를 통과해야 한다.
+
+        `save_stage` 를 쓰지 않는 이유: `force_sold` 는 전이표를 의도적으로
+        우회하는데 `save_stage` 의 가드는 그 표를 참조한다. 우회 플래그를 두면
+        가드가 막고 있는 모든 것(체결값 덮어쓰기, 상태 역행)이 그 문으로
+        들어온다. 그래서 전용 경로를 두고 **입력을 엄격히 검사한다.**
+
+        원자적이어야 하는 이유: 절반만 청산된 상태 — 사이클은 CLOSED 인데
+        단계가 HOLDING 으로 남거나 그 반대 — 는 어느 경로로도 정리할 수 없다.
+
+        검사가 `with self._conn:` **앞에** 있는 이유: 부분 실행 자체가 없어야
+        한다. 트랜잭션 안에서 검사하면 롤백에 의존하게 된다.
+        """
+        if cycle.close_reason not in (CloseReason.EMERGENCY, CloseReason.FORCED):
+            raise ValueError(
+                f"emergency_close_cycle requires close_reason EMERGENCY or "
+                f"FORCED, got {cycle.close_reason} — 정상 종료는 save_stage 의 "
+                f"가드를 통과해야 한다"
+            )
+        not_sold = [s.stage_no for s in stages
+                    if s.status is not StageStatus.SOLD]
+        if not_sold:
+            raise StageInvariantError(
+                f"emergency_close_cycle requires every stage to be SOLD; "
+                f"stages {not_sold} are not"
+            )
+        # 완전성은 **사이클이 가진 단계 수**와 비교해야 한다. 넘겨받은 목록의
+        # 길이와 비교하면 연속성만 확인하게 되고, 7단계 사이클에 1~3 만 쓰는
+        # 것이 통과한다 — 그러면 이후 `load_stages` 가 H3 로 그 사이클을
+        # 로드하지 못해 사용자가 손댈 수 없는 상태가 된다.
+        if cycle.ladder is not None:
+            total = cycle.ladder.max_stages
+        else:
+            # 긴급청산은 앵커가 생기기 전(STARTING)에도 시작할 수 있으므로
+            # 사다리가 없을 수 있다 (설계서 11.1절). 그때는 저장된 행 수가
+            # 유일한 기준이다.
+            row = self._conn.execute(
+                "SELECT count(*) AS n FROM stage_state WHERE cycle_id = ?",
+                (cycle.cycle_id,),
+            ).fetchone()
+            total = int(dict(row)["n"])
+        expected = set(range(1, total + 1))
+        if {s.stage_no for s in stages} != expected:
+            raise StageInvariantError(
+                f"emergency_close_cycle requires the complete stage set "
+                f"1..{total}, got {sorted(s.stage_no for s in stages)}"
+            )
+        row = cycle_to_row(cycle)
+        with self._conn:
+            cursor = self._conn.execute(
+                "UPDATE cycle SET status = :status, "
+                " close_reason = :close_reason, closed_at = :closed_at, "
+                " forced_close_reason = :forced_close_reason, "
+                " forced_close_qty = :forced_close_qty "
+                "WHERE id = :id",
+                row | {"id": cycle.cycle_id},
+            )
+            if cursor.rowcount == 0:
+                raise RowNotFound(f"no cycle row with id={cycle.cycle_id}")
+            for stage in stages:
+                self._conn.execute(
+                    "UPDATE stage_state SET status = :status, "
+                    " fill_price = :fill_price, fill_qty = :fill_qty, "
+                    " bought_at = :bought_at, last_sold_at = :last_sold_at, "
+                    " rebuy_count = :rebuy_count "
+                    "WHERE cycle_id = :cycle_id AND stage_no = :stage_no",
+                    stage_to_row(cycle.cycle_id, stage),
+                )
+
+    def set_realized_pnl(self, cycle_id: int, value: int) -> None:
+        """사이클 종료 시 엔진이 `realized_pnl_for_cycle` 의 값을 기록한다.
+
+        `cycle_to_row` 가 이 컬럼을 의도적으로 제외하므로(도메인 `Cycle` 에
+        그 필드가 없다) 전용 경로가 필요하다.
+        """
+        with self._conn:
+            cursor = self._conn.execute(
+                "UPDATE cycle SET realized_pnl = ? WHERE id = ?",
+                (value, cycle_id),
+            )
+            if cursor.rowcount == 0:
+                raise RowNotFound(f"no cycle with id {cycle_id}")
 
     # ── 주문 이력 ───────────────────────────────────────────────────────
     # PARTIAL 은 대기(pending) 쪽에 있어야 한다 — 부분체결 후 잔량이 여전히
@@ -402,8 +516,13 @@ class SqliteRepository:
         `str` 로 남긴다 — 대응하는 도메인 enum 이 없다.
         """
         placeholders = ", ".join("?" for _ in self._PENDING_STATUSES)
+        # `LEFT JOIN` 인 이유: 긴급청산 주문은 `stage_state_id` 가 `None`
+        # 이므로 내부 조인이면 그 행이 사라진다 — 재시작 복구가 미체결 시장가
+        # 주문을 놓치게 된다.
         rows = self._conn.execute(
-            f"SELECT * FROM order_log WHERE status IN ({placeholders}) ORDER BY id",
+            "SELECT o.*, s.stage_no AS stage_no FROM order_log o "
+            "LEFT JOIN stage_state s ON s.id = o.stage_state_id "
+            f"WHERE o.status IN ({placeholders}) ORDER BY o.id",
             self._PENDING_STATUSES,
         ).fetchall()
         return [
@@ -421,6 +540,7 @@ class SqliteRepository:
                 fill_qty=r["fill_qty"],
                 status=r["status"],
                 sent_at=text_to_dt(r["sent_at"]),
+                stage_no=r["stage_no"],
             )
             for r in rows
         ]
@@ -506,6 +626,45 @@ class SqliteRepository:
                  verdict, action_taken),
             )
         return int(cursor.lastrowid)
+
+    def forced_close_baseline(self, stock_code: str) -> int:
+        """이 종목에서 강제 종료된 누적 수량 — 마지막 기준선 초기화 이후만.
+
+        설계서 11.4절은 `forced_close_qty` 를 종목별로 누적해 대사 기준선으로
+        삼고 사용자가 초기화할 수단을 두라고 요구한다. 초기화 시점을 담을
+        컬럼이 없고 스키마는 버전 1을 넘는 마이그레이션 경로가 없으므로
+        (`CREATE TABLE IF NOT EXISTS` 는 기존 테이블을 바꾸지 못한다),
+        초기화를 `reconcile_log` 의 `action_taken='BASELINE_RESET'` 행으로
+        표현한다.
+
+        `closed_at > ''` 비교가 성립하는 이유: `closed_at` 은 ISO-8601 TEXT
+        이고 SQLite 의 문자열 비교는 사전순이며 ISO-8601 은 사전순 = 시간순이다
+        (코덱이 그 형식을 보장한다). 초기화가 없으면 `''` 가 모든 시각보다
+        작으므로 전체가 집계된다.
+        """
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(c.forced_close_qty), 0) AS total "
+            "FROM cycle c JOIN split_config s ON s.id = c.config_id "
+            "WHERE s.stock_code = ? AND c.close_reason = 'FORCED' "
+            "  AND c.closed_at > COALESCE(("
+            "     SELECT MAX(checked_at) FROM reconcile_log "
+            "     WHERE stock_code = ? AND action_taken = 'BASELINE_RESET'"
+            "  ), '')",
+            (stock_code, stock_code),
+        ).fetchone()
+        return int(dict(row)["total"])
+
+    def reset_forced_close_baseline(
+        self, stock_code: str, *, at: datetime
+    ) -> None:
+        """사용자가 남은 주식을 처리했다고 알린 시점을 기록한다.
+
+        설계서 11.4절 — 대사 제외는 영구적이지 않다.
+        """
+        self.append_reconcile_log(
+            checked_at=at, stock_code=stock_code, internal_qty=0,
+            broker_qty=0, verdict="MATCH", action_taken="BASELINE_RESET",
+        )
 
     # ── 보유현황 뷰 ─────────────────────────────────────────────────────
     def holdings(self) -> list[HoldingRow]:

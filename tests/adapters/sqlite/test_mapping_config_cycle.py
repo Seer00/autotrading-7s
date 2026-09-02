@@ -131,17 +131,18 @@ def test_cycle_round_trip_idle_with_no_anchor():
     assert restored.anchor_price is None and restored.ladder is None
 
 
-def test_cycle_round_trip_closed_forced_restores_status_and_reason_only():
-    """D20 — FORCED 행에서 왕복하는 것은 `status` 와 `close_reason` 뿐이다.
+def test_cycle_round_trip_closed_forced_carries_statement_and_remainder():
+    """D20 — 강제 종료의 증언과 잔량이 왕복한다 (설계서 11.4절).
 
-    이 테스트는 이전에 "강제 종료의 증언과 잔량이 왕복해야 한다" 는 이름과
-    문서를 달고 있었지만, 실제로는 `status`·`close_reason` 만 확인했다 —
-    증언(`forced_close_reason`)도 잔량(`forced_close_qty`)도 보지 않았다.
-    실제로 그 둘은 왕복하지 않는다: `Cycle` 에 그 값을 담을 필드가 없다
-    (`cycle_to_row` 도 그 두 컬럼을 다루지 않는다). 아래는 그 부재 자체를
-    고정한다 — Plan 2B 가 D20 의 강제 종료 전이를 추가할 때 `Cycle` 에 필드를
-    얹으면 이 assert 가 실패로 알려준다(이름을 바꿔 실제로 왕복하는지
-    검증하는 테스트로 승격해야 한다는 신호다).
+    Plan 2A 는 이 테스트를 "그 둘이 왕복하지 **않는다**" 는 부재 고정으로
+    남겨두고, `Cycle` 에 필드가 생기면 실패로 알려주도록 해뒀다 — 그때
+    "이름을 바꿔 실제로 왕복하는지 검증하는 테스트로 승격해야 한다" 는 신호를
+    붙여서. Plan 2B 가 D20 전이를 추가하면서 그 신호가 울렸고, 여기가 그
+    승격이다.
+
+    왕복이 중요한 이유: 증언은 사용자가 "잔량이 얼마인지 알고 있으며 내가
+    처리한다" 고 기록한 것이고, 그것을 잃으면 프로그램 관리 밖에 남은 주식이
+    왜 그렇게 됐는지 답할 수 있는 유일한 근거가 사라진다.
     """
     lad = a_ladder()
     row = cycle_to_row(
@@ -155,12 +156,32 @@ def test_cycle_round_trip_closed_forced_restores_status_and_reason_only():
     restored = row_to_cycle(row)
     assert restored.status is CycleStatus.CLOSED
     assert restored.close_reason is CloseReason.FORCED
-    # Cycle 은 D20 의 증언·잔량을 담을 필드가 없다 — 그래서 위 두 assert
-    # 만으로는 그 두 컬럼이 왕복하는지 알 수 없다. 여기서 그 부재를 직접
-    # 확인한다: 필드가 생기면 이 assert 가 실패해 회귀를 알려준다.
+    assert restored.forced_close_reason == "거래정지로 청산 불가"
+    assert restored.forced_close_qty == 40
+    # 왕복의 반대 방향도 확인한다 — cycle_to_row 가 두 컬럼을 내보내야
+    # save_cycle 이 스키마의 D20 CHECK 를 만족시킬 수 있다.
+    assert cycle_to_row(restored)["forced_close_reason"] == "거래정지로 청산 불가"
+    assert cycle_to_row(restored)["forced_close_qty"] == 40
     cycle_fields = {f.name for f in dataclasses.fields(Cycle)}
-    assert "forced_close_reason" not in cycle_fields
-    assert "forced_close_qty" not in cycle_fields
+    assert {"forced_close_reason", "forced_close_qty"} <= cycle_fields
+
+
+def test_row_to_cycle_rejects_forced_without_a_statement():
+    """스키마의 D20 CHECK 와 같은 것을 도메인이 말하므로 복원도 거부한다.
+
+    두 층이 같은 불변식을 말하면 어긋날 수 없다. 스키마만 말하면, CHECK 가
+    없던 시절에 쓰인 행이나 다른 경로로 들어온 행이 조용히 통과한다.
+    """
+    row = cycle_to_row(
+        Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.RUNNING,
+              anchor_price=10_000, ladder=a_ladder(), started_at=T0)
+    ) | {
+        "id": 3, "status": "CLOSED", "close_reason": "FORCED",
+        "closed_at": "2026-09-01T15:30:00+00:00",
+    }
+    with pytest.raises(CorruptRowError) as exc:
+        row_to_cycle(row)
+    assert "FORCED" in str(exc.value)
 
 
 def test_row_to_cycle_wraps_an_anchor_ladder_mismatch():

@@ -48,6 +48,11 @@ class Cycle:
     close_reason: CloseReason | None = None
     started_at: datetime | None = None
     closed_at: datetime | None = None
+    # D20 강제 종료의 증언과 잔량 (설계서 11.4절). 스키마의 CHECK 와 같은
+    # 불변식을 __post_init__ 이 도메인에서도 말한다 — 두 층이 같은 것을 말하면
+    # 어긋날 수 없고, 한 층만 말하면 다른 경로로 들어온 값이 통과한다.
+    forced_close_reason: str | None = None
+    forced_close_qty: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("cycle_id", "config_id", "seq"):
@@ -88,6 +93,32 @@ class Cycle:
                 raise DomainInvariantError(
                     f"anchor_price {self.anchor_price} != "
                     f"ladder.anchor_price {self.ladder.anchor_price}"
+                )
+
+        # D20 (설계서 11.4절) — 스키마의 CHECK 와 같은 불변식이다. 두 층이 같은
+        # 것을 말하면 어긋날 수 없고, 한 층만 말하면 다른 경로로 들어온 값이
+        # 통과한다. FORCED 인 종료는 증언과 잔량이 둘 다 있어야 하고, FORCED 가
+        # 아닌 종료는 둘 다 없어야 한다.
+        forced = self.close_reason is CloseReason.FORCED
+        has_fields = (self.forced_close_reason is not None
+                      and self.forced_close_qty is not None)
+        if forced != has_fields:
+            raise DomainInvariantError(
+                f"close_reason FORCED and forced_close_* must agree: "
+                f"close_reason={self.close_reason}, "
+                f"forced_close_reason={self.forced_close_reason!r}, "
+                f"forced_close_qty={self.forced_close_qty!r}"
+            )
+        if self.forced_close_qty is not None:
+            if (isinstance(self.forced_close_qty, bool)
+                    or not isinstance(self.forced_close_qty, int)):
+                raise TypeError(
+                    f"forced_close_qty must be int, not "
+                    f"{type(self.forced_close_qty).__name__}"
+                )
+            if self.forced_close_qty <= 0:
+                raise DomainInvariantError(
+                    f"forced_close_qty must be positive: {self.forced_close_qty}"
                 )
 
     @property
@@ -184,6 +215,46 @@ def close(
             f"cannot close cycle with {held} shares still held — not all stages complete"
         )
     return replace(cycle, status=CycleStatus.CLOSED, close_reason=reason, closed_at=at)
+
+
+def force_close(cycle: Cycle, *, reason: str, qty: int, at: datetime) -> Cycle:
+    """D20 강제 종료 — 설계서 11.4절.
+
+    `close()` 의 우회가 아니라 별도 경로다. `close()` 는 보유 0 을 확인하고,
+    이 함수는 **보유가 남았다는 사실 자체를 기록한다.** 그래서 단계 목록을
+    요구하지 않으며 `is_cycle_complete` 를 부르지 않는다.
+
+    `LIQUIDATING` 에서만 호출할 수 있다. 사용자가 먼저 긴급청산을 시도해야
+    하며, 그 시도 이력(횟수·시각·실패 사유)이 강제 종료 다이얼로그의 근거가
+    된다. `RUNNING` 에서 바로 강제 종료하는 경로를 두면 그 근거 없이 내부
+    기록과 실계좌를 어긋나게 만들 수 있다.
+
+    설계서 10.2절이 금지하는 것과 구분된다 — 10.2절이 금지하는 것은
+    **프로그램이** 불일치를 조용히 만드는 것이고, 이것은 사용자가 "잔량이
+    얼마인지 알고 있으며 내가 처리한다" 고 명시적으로 증언하는 것이다.
+
+    `_guard` 를 쓰지 않는 이유: 전이표는 `LIQUIDATING → CLOSED` 외에
+    `RUNNING → CLOSED` 등도 허용하는데, 이 함수는 그보다 **좁은** 조건을
+    강제하므로 직접 검사하는 것이 의도를 드러낸다.
+    """
+    if cycle.status is not CycleStatus.LIQUIDATING:
+        raise IllegalCycleTransition(
+            f"force_close requires LIQUIDATING, not {cycle.status.value} "
+            f"(설계서 11.4절 — 긴급청산을 먼저 시도해야 한다)"
+        )
+    if isinstance(qty, bool) or not isinstance(qty, int):
+        raise TypeError(f"qty must be int, not {type(qty).__name__}")
+    if qty <= 0:
+        raise DomainInvariantError(
+            f"qty must be positive: {qty} — 잔량 0 의 강제 종료는 정상 close() "
+            f"로 처리한다 (설계서 11.4절 절차 ③)"
+        )
+    if not reason or not reason.strip():
+        raise DomainInvariantError("reason must be a non-empty statement")
+    return replace(
+        cycle, status=CycleStatus.CLOSED, close_reason=CloseReason.FORCED,
+        closed_at=at, forced_close_reason=reason, forced_close_qty=qty,
+    )
 
 
 def is_cycle_complete(states: Sequence[StageState]) -> bool:
