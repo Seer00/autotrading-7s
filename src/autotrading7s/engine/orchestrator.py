@@ -38,6 +38,7 @@ from autotrading7s.app.events import (
     TickUpdate,
 )
 from autotrading7s.app.settings import EngineSettings
+from autotrading7s.app.snapshot import ConfigSnapshot, Snapshot
 from autotrading7s.domain import cycle as cycle_mod
 from autotrading7s.domain.cycle import Cycle
 from autotrading7s.domain.errors import DomainInvariantError
@@ -92,6 +93,7 @@ class Orchestrator:
         self._reconciler = Reconciler(repo=repo, broker=broker, clock=clock,
                                       emit=self._emit)
         self._last_reconcile: object = None
+        self._last_snapshot_core: tuple[object, ...] | None = None
         self.stopped = False
 
     def _emit(self, event: Event) -> None:
@@ -100,6 +102,7 @@ class Orchestrator:
     # ── 명령 소비 ───────────────────────────────────────────────────────
     async def drain_commands(self) -> None:
         """`priority_q` 를 먼저 완전히 비우고, 그 다음 `command_q` 를 본다."""
+        handled = False
         for q in (self._priority_q, self._command_q):
             while True:
                 try:
@@ -107,6 +110,10 @@ class Orchestrator:
                 except queue.Empty:
                     break
                 await self._handle(command)
+                handled = True
+        if handled:
+            # [시작]을 눌렀는데 화면이 그대로면 사용자는 눌렸는지 알 수 없다.
+            self.emit_snapshot_if_changed()
 
     async def _handle(self, command: cmd.Command) -> None:
         if isinstance(command, cmd.EmergencyLiquidate):
@@ -271,6 +278,73 @@ class Orchestrator:
         self._repo.save_cycle(cycle_mod.confirm_anchor(
             cyc, anchor_price=tick.price, ladder=ladder, at=tick.at))
 
+    # ── 스냅샷 ──────────────────────────────────────────────────────────
+    def build_snapshot(self) -> Snapshot:
+        """설계서 14.1절의 표를 그릴 수 있는 상태를 모은다.
+
+        `holdings()` 뷰를 쓰지 않는 이유: 그 뷰는 보유 단계로 조인하므로
+        보유 0 인 설정이 행을 만들지 못하고(목업의 `NAVER 0/5 IDLE`)
+        `config_id` 도 없어서 명령 대상을 알 수 없다.
+        """
+        by_config = {c.config_id: c for c in self._repo.load_active_cycles()}
+        pending: dict[int, int] = {}
+        for row in self._repo.load_pending_orders():
+            pending[row.cycle_id] = pending.get(row.cycle_id, 0) + 1
+
+        configs: list[ConfigSnapshot] = []
+        for config in self._repo.list_configs():
+            cyc = by_config.get(config.config_id)
+            stages: tuple[StageState, ...] = ()
+            if cyc is not None:
+                try:
+                    stages = tuple(self._repo.load_stages(cyc.cycle_id))
+                except CorruptRowError:
+                    # 손상된 사이클도 담는다 — 표에서 사라지면 사용자는 그것이
+                    # 존재하는지조차 모른다. 2A 핸드오버 7 이 요구한 "사용자에게
+                    # 나갈 길" 의 최소 조건은 그 설정이 화면에 보이는 것이다.
+                    # 실패의 내용은 CycleLoadFailed 이벤트가 전달한다.
+                    stages = ()
+            configs.append(ConfigSnapshot(
+                config_id=config.config_id,
+                stock_code=config.stock_code,
+                stock_name=config.stock_name,
+                label=config.label,
+                config_status=config.status,
+                max_stages=config.max_stages,
+                drop_pct=config.drop_pct,
+                target_pct=config.target_pct,
+                amount_per_stage=config.amount_per_stage,
+                allow_rebuy=config.allow_rebuy,
+                rebuy_cooldown_sec=config.rebuy_cooldown_sec,
+                stock_limit=config.total_limit,
+                cycle_id=None if cyc is None else cyc.cycle_id,
+                cycle_seq=None if cyc is None else cyc.seq,
+                cycle_status=None if cyc is None else cyc.status,
+                anchor_price=None if cyc is None else cyc.anchor_price,
+                ladder=None if cyc is None else cyc.ladder,
+                cycle_started_at=None if cyc is None else cyc.started_at,
+                stages=stages,
+                pending_orders=(0 if cyc is None
+                                else pending.get(cyc.cycle_id, 0)),
+            ))
+        return Snapshot(configs=tuple(configs),
+                        total_limit=self._settings.total_limit,
+                        at=self._clock.now())
+
+    def emit_snapshot_if_changed(self) -> bool:
+        """상태가 변했을 때만 발행한다. 발행했으면 True.
+
+        `Snapshot.core` 가 `at` 을 제외하므로 유휴 틱에서는 아무것도 나가지
+        않는다. 시간 주기로 거르는 대안은 `FakeClock` 이 멈춘 테스트에서 첫
+        스냅샷만 나가게 만들어 그 경로를 검증할 수 없게 한다.
+        """
+        snap = self.build_snapshot()
+        if snap.core == self._last_snapshot_core:
+            return False
+        self._last_snapshot_core = snap.core
+        self._emit(snap)
+        return True
+
     # ── 미체결 감시 ─────────────────────────────────────────────────────
     async def poll_pending(self) -> None:
         """DB 를 진실로 삼는다 — 메모리 캐시를 두면 재시작 복구와 두 개의
@@ -343,6 +417,9 @@ class Orchestrator:
         `asyncio.create_task` 로 분리하는 것이 다음 단계다.
         """
         await self.drain_commands()
+        # GUI 는 기동 직후 화면을 그려야 한다 — 첫 틱을 기다릴 수 없고, 활성
+        # 사이클이 없으면 아래 루프가 바로 반환하므로 여기서 내야 한다.
+        self.emit_snapshot_if_changed()
         rounds = 0
         while not self.stopped:
             codes = self._subscribed_codes()
@@ -375,6 +452,7 @@ class Orchestrator:
         await self.poll_pending()
         if self._due_for_reconcile(tick):
             await self.reconcile()
+        self.emit_snapshot_if_changed()
 
     async def _fallback(self, codes: list[str]) -> None:
         """설계서 8.4절 — REST 폴백. **트리거 판정은 계속 수행한다.**
