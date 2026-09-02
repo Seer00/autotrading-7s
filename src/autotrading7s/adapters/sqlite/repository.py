@@ -14,6 +14,7 @@ SQL 과 트랜잭션 경계만 다룬다.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Sequence
 from datetime import datetime
 
 from autotrading7s.adapters.sqlite.codec import dt_to_text, text_to_dt
@@ -37,7 +38,13 @@ from autotrading7s.ports.repository import (
 from autotrading7s.domain.cycle import Cycle
 from autotrading7s.domain.stage import StageState
 from autotrading7s.domain.stage import _ALLOWED as _STAGE_TRANSITIONS
-from autotrading7s.domain.types import CycleStatus, OrderPath, Side, StageStatus
+from autotrading7s.domain.types import (
+    CloseReason,
+    CycleStatus,
+    OrderPath,
+    Side,
+    StageStatus,
+)
 
 
 class SqliteRepository:
@@ -265,6 +272,96 @@ class SqliteRepository:
                 f"ON CONFLICT(cycle_id, stage_no) DO UPDATE SET {updates}",
                 row,
             )
+
+    def emergency_close_cycle(
+        self, *, cycle: Cycle, stages: Sequence[StageState]
+    ) -> None:
+        """긴급청산·강제 종료의 원자적 쓰기 — 설계서 11.1절 ⑤⑦, 11.4절 ⑤⑥.
+
+        `close_reason` 이 `EMERGENCY` 이거나 `FORCED` 인 사이클만 받는다.
+        정상 종료는 이 문을 쓸 수 없다 — 정상 경로는 `save_stage` 의 가드와
+        `close()` 의 보유 0 검사를 통과해야 한다.
+
+        `save_stage` 를 쓰지 않는 이유: `force_sold` 는 전이표를 의도적으로
+        우회하는데 `save_stage` 의 가드는 그 표를 참조한다. 우회 플래그를 두면
+        가드가 막고 있는 모든 것(체결값 덮어쓰기, 상태 역행)이 그 문으로
+        들어온다. 그래서 전용 경로를 두고 **입력을 엄격히 검사한다.**
+
+        원자적이어야 하는 이유: 절반만 청산된 상태 — 사이클은 CLOSED 인데
+        단계가 HOLDING 으로 남거나 그 반대 — 는 어느 경로로도 정리할 수 없다.
+
+        검사가 `with self._conn:` **앞에** 있는 이유: 부분 실행 자체가 없어야
+        한다. 트랜잭션 안에서 검사하면 롤백에 의존하게 된다.
+        """
+        if cycle.close_reason not in (CloseReason.EMERGENCY, CloseReason.FORCED):
+            raise ValueError(
+                f"emergency_close_cycle requires close_reason EMERGENCY or "
+                f"FORCED, got {cycle.close_reason} — 정상 종료는 save_stage 의 "
+                f"가드를 통과해야 한다"
+            )
+        not_sold = [s.stage_no for s in stages
+                    if s.status is not StageStatus.SOLD]
+        if not_sold:
+            raise StageInvariantError(
+                f"emergency_close_cycle requires every stage to be SOLD; "
+                f"stages {not_sold} are not"
+            )
+        # 완전성은 **사이클이 가진 단계 수**와 비교해야 한다. 넘겨받은 목록의
+        # 길이와 비교하면 연속성만 확인하게 되고, 7단계 사이클에 1~3 만 쓰는
+        # 것이 통과한다 — 그러면 이후 `load_stages` 가 H3 로 그 사이클을
+        # 로드하지 못해 사용자가 손댈 수 없는 상태가 된다.
+        if cycle.ladder is not None:
+            total = cycle.ladder.max_stages
+        else:
+            # 긴급청산은 앵커가 생기기 전(STARTING)에도 시작할 수 있으므로
+            # 사다리가 없을 수 있다 (설계서 11.1절). 그때는 저장된 행 수가
+            # 유일한 기준이다.
+            row = self._conn.execute(
+                "SELECT count(*) AS n FROM stage_state WHERE cycle_id = ?",
+                (cycle.cycle_id,),
+            ).fetchone()
+            total = int(dict(row)["n"])
+        expected = set(range(1, total + 1))
+        if {s.stage_no for s in stages} != expected:
+            raise StageInvariantError(
+                f"emergency_close_cycle requires the complete stage set "
+                f"1..{total}, got {sorted(s.stage_no for s in stages)}"
+            )
+        row = cycle_to_row(cycle)
+        with self._conn:
+            cursor = self._conn.execute(
+                "UPDATE cycle SET status = :status, "
+                " close_reason = :close_reason, closed_at = :closed_at, "
+                " forced_close_reason = :forced_close_reason, "
+                " forced_close_qty = :forced_close_qty "
+                "WHERE id = :id",
+                row | {"id": cycle.cycle_id},
+            )
+            if cursor.rowcount == 0:
+                raise RowNotFound(f"no cycle row with id={cycle.cycle_id}")
+            for stage in stages:
+                self._conn.execute(
+                    "UPDATE stage_state SET status = :status, "
+                    " fill_price = :fill_price, fill_qty = :fill_qty, "
+                    " bought_at = :bought_at, last_sold_at = :last_sold_at, "
+                    " rebuy_count = :rebuy_count "
+                    "WHERE cycle_id = :cycle_id AND stage_no = :stage_no",
+                    stage_to_row(cycle.cycle_id, stage),
+                )
+
+    def set_realized_pnl(self, cycle_id: int, value: int) -> None:
+        """사이클 종료 시 엔진이 `realized_pnl_for_cycle` 의 값을 기록한다.
+
+        `cycle_to_row` 가 이 컬럼을 의도적으로 제외하므로(도메인 `Cycle` 에
+        그 필드가 없다) 전용 경로가 필요하다.
+        """
+        with self._conn:
+            cursor = self._conn.execute(
+                "UPDATE cycle SET realized_pnl = ? WHERE id = ?",
+                (value, cycle_id),
+            )
+            if cursor.rowcount == 0:
+                raise RowNotFound(f"no cycle with id {cycle_id}")
 
     # ── 주문 이력 ───────────────────────────────────────────────────────
     # PARTIAL 은 대기(pending) 쪽에 있어야 한다 — 부분체결 후 잔량이 여전히

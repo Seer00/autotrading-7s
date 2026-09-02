@@ -10,6 +10,7 @@ tz-aware datetime)을 강제하는 지점이다.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from dataclasses import dataclass
 from decimal import Decimal
@@ -261,6 +262,33 @@ class RepositoryPort(Protocol):
         전이에서든 증가시키거나), 도메인 전이표가 허용하지 않는 상태로
         옮기려 할 때. 같은 상태로의 재저장(매 틱의 정상 흐름)과 같은 값의
         재확인은 허용한다.
+        """
+        ...
+
+    def emergency_close_cycle(
+        self, *, cycle: Cycle, stages: Sequence[StageState]
+    ) -> None:
+        """긴급청산·강제 종료의 원자적 쓰기 — 설계서 11.1절 ⑤⑦, 11.4절 ⑤⑥.
+
+        `close_reason` 이 `EMERGENCY` 이거나 `FORCED` 인 사이클만 받는다.
+        정상 종료는 이 문을 쓸 수 없다 — 정상 경로는 `save_stage` 의 가드와
+        `close()` 의 보유 0 검사를 통과해야 한다.
+
+        `save_stage` 를 쓰지 않는 이유: `force_sold` 는 전이표를 의도적으로
+        우회하는데 `save_stage` 의 가드는 그 표를 참조한다. 우회 플래그를 두면
+        가드가 막고 있는 모든 것(체결값 덮어쓰기, 상태 역행)이 그 문으로
+        들어온다. 그래서 전용 경로를 두고 입력을 엄격히 검사한다.
+
+        원자적이어야 하는 이유: 절반만 청산된 상태 — 사이클은 CLOSED 인데
+        단계가 HOLDING 으로 남거나 그 반대 — 는 어느 경로로도 정리할 수 없다.
+        """
+        ...
+
+    def set_realized_pnl(self, cycle_id: int, value: int) -> None:
+        """사이클 종료 시 `realized_pnl_for_cycle` 의 값을 기록한다.
+
+        `cycle_to_row` 가 이 컬럼을 의도적으로 제외하므로(도메인 `Cycle` 에
+        그 필드가 없다) 전용 경로가 필요하다.
         """
         ...
 

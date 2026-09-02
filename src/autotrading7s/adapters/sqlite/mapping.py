@@ -140,6 +140,10 @@ def cycle_to_row(cycle: Cycle) -> dict[str, Any]:
         "anchor_price": cycle.anchor_price,
         "ladder_json": None if cycle.ladder is None else ladder_to_json(cycle.ladder),
         "close_reason": None if cycle.close_reason is None else cycle.close_reason.value,
+        # D20 (설계서 11.4절). realized_pnl 은 여전히 제외한다 — Cycle 에 그
+        # 필드가 없고 set_realized_pnl 이 유일한 쓰기 경로다.
+        "forced_close_reason": cycle.forced_close_reason,
+        "forced_close_qty": cycle.forced_close_qty,
         "started_at": None if cycle.started_at is None else dt_to_text(cycle.started_at),
         "closed_at": None if cycle.closed_at is None else dt_to_text(cycle.closed_at),
     }
@@ -165,6 +169,8 @@ def row_to_cycle(row: Mapping[str, Any]) -> Cycle:
             close_reason=close_reason,
             started_at=None if started is None else text_to_dt(started),
             closed_at=None if closed is None else text_to_dt(closed),
+            forced_close_reason=row["forced_close_reason"],
+            forced_close_qty=row["forced_close_qty"],
         )
     except ValueError as exc:
         # CycleStatus·CloseReason 의 알 수 없는 값도 ValueError 이며, 그것 역시
