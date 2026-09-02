@@ -26,6 +26,7 @@ from autotrading7s.adapters.sqlite.mapping import (
     stage_to_row,
 )
 from autotrading7s.ports.repository import (
+    HoldingRow,
     OrderLogInvariantError,
     OrderLogNotFound,
     SplitConfig,
@@ -337,3 +338,70 @@ class SqliteRepository:
             (cycle_id,),
         ).fetchone()
         return int(row["pnl"])
+
+    # ── 이력 로그 ───────────────────────────────────────────────────────
+    def append_emergency_log(
+        self, *, scope: str, stock_code: str | None, cycle_id: int | None,
+        requested_at: datetime, reason: str | None, qty_before: int | None,
+        qty_after: int | None, canceled_orders: int | None, result: str,
+        detail_json: str | None, completed_at: datetime | None,
+    ) -> int:
+        """긴급청산 이력. 설계서 11.1절 ⑥ 과 D20 의 강제 종료(result=FORCED_CLOSE)."""
+        with self._conn:
+            cursor = self._conn.execute(
+                "INSERT INTO emergency_liquidation_log (scope, stock_code, "
+                " cycle_id, requested_at, reason, qty_before, qty_after, "
+                " canceled_orders, result, detail_json, completed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (scope, stock_code, cycle_id, dt_to_text(requested_at), reason,
+                 qty_before, qty_after, canceled_orders, result, detail_json,
+                 None if completed_at is None else dt_to_text(completed_at)),
+            )
+        return int(cursor.lastrowid)
+
+    def append_reconcile_log(
+        self, *, checked_at: datetime, stock_code: str, internal_qty: int,
+        broker_qty: int, verdict: str, action_taken: str | None,
+    ) -> int:
+        """대사 이력. 설계서 10.2절 — 일치는 로그 없음이 원칙이지만, 이력
+        테이블에는 남겨 사후에 대사가 실제로 돌았는지 확인할 수 있게 한다."""
+        with self._conn:
+            cursor = self._conn.execute(
+                "INSERT INTO reconcile_log (checked_at, stock_code, "
+                " internal_qty, broker_qty, verdict, action_taken) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (dt_to_text(checked_at), stock_code, internal_qty, broker_qty,
+                 verdict, action_taken),
+            )
+        return int(cursor.lastrowid)
+
+    # ── 보유현황 뷰 ─────────────────────────────────────────────────────
+    def holdings(self) -> list[HoldingRow]:
+        """설계서 12.3절의 뷰를 읽어 HoldingRow 로 변환한다.
+
+        현재가와 평가손익률은 없다 — 실시간 값이므로 UI 가 최신 틱과 결합해
+        `domain/pnl.py` 의 순수 함수로 계산한다.
+
+        **`avg_price` 는 표시용이다.** 뷰는 SQL 의 정수 나눗셈으로 계산하므로
+        절사이고, `domain/pnl.py` 의 `avg_price` 는 half-up 반올림이다 —
+        투입금액을 수량으로 나눈 소수부가 0.5 이상이면 두 값이 1원 갈린다.
+        UI 는 이 값을 목록 표시에 쓰되, 손익 계산에는 반드시 `domain/pnl.py`
+        의 함수를 써야 한다.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM holdings ORDER BY stock_code, label"
+        ).fetchall()
+        return [
+            HoldingRow(
+                stock_code=r["stock_code"],
+                stock_name=r["stock_name"],
+                label=r["label"],
+                cycle_id=r["cycle_id"],
+                total_qty=int(r["total_qty"]),
+                avg_price=int(r["avg_price"]),
+                holding_stages=int(r["holding_stages"]),
+                max_stages=int(r["max_stages"]),
+                cycle_status=CycleStatus(r["cycle_status"]),
+            )
+            for r in rows
+        ]
