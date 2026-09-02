@@ -122,6 +122,23 @@ def _eval_buy(
         # 제외하는 것이 중복 주문을 막는 방어선이다.
         if state is None or state.status is not StageStatus.WAITING:
             continue
+        # 규칙 3 — 재매수 쿨다운. last_sold_at 이 있으면 한 번 팔린 단계다.
+        # 쿨다운이 없으면 같은 단계가 수수료를 태우며 분당 수십 번 회전한다.
+        if state.last_sold_at is not None:
+            if not params.allow_rebuy:
+                continue
+            _require_aware(now, f"now (stage {stage_no})")
+            _require_aware(state.last_sold_at, f"last_sold_at (stage {stage_no})")
+            elapsed = (now - state.last_sold_at).total_seconds()
+            # elapsed 가 음수(시계 역행 — NTP 보정, 손상된 미래 타임스탬프)면
+            # 이 비교는 항상 재매수를 막는다. 이것은 의도된 안전한 방향이다:
+            # 도메인이 경과 시간을 알 수 없을 때는 거래하지 않는 것이 맞는
+            # 답이고, 설계 문서의 일관된 태도와 맞는다. last_sold_at 이
+            # 지속적으로 미래를 가리키는 경우 이 단계는 계속 막히지만, 그
+            # 탐지는 Plan 2 의 정합성 검사(reconciliation)가 할 일이며 이
+            # 쿨다운 검사의 책임이 아니다.
+            if elapsed < params.rebuy_cooldown_sec:
+                continue
         if tick.price > state.trigger_price:
             continue
         qty = ladder.planned_qty(stage_no)
@@ -134,7 +151,8 @@ def _eval_buy(
             limit_price=tick.price,
             qty=qty,
             reason=_buy_reason(stage_no=stage_no, tick=tick,
-                               trigger=state.trigger_price, ladder=ladder),
+                               trigger=state.trigger_price, ladder=ladder,
+                               state=state),
         )
     return None
 
@@ -180,16 +198,34 @@ def _eval_sells(
     return out
 
 
+def _require_aware(dt: datetime, label: str) -> None:
+    """`dt` 가 타임존 인식(aware) 인지 확인한다.
+
+    naive datetime 을 aware 와 뺄셈하면 ``TypeError`` 가 터진다. 그 예외는
+    틱 루프 안에서 어느 단계·어느 필드가 원인인지 알려주지 않는다. Plan 2 의
+    SQLite 저장소가 TEXT 컬럼에서 타임스탬프를 파싱할 때 tzinfo 를 잃어버리기
+    쉬우므로, 이 쿨다운 검사가 소비하는 지점에서 미리 검증해 원인을 밝힌다.
+    """
+    if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+        raise ValueError(f"{label} must be timezone-aware, got naive datetime: {dt!r}")
+
+
 def _pct(value: Decimal) -> str:
     return f"{(value * 100).normalize()}"
 
 
-def _buy_reason(*, stage_no: int, tick: Tick, trigger: int, ladder: Ladder) -> str:
-    return (
-        f"stage={stage_no} BUY | tick={tick.price}({tick.source.value}) "
-        f"<= trigger={trigger} | anchor={ladder.anchor_price} "
-        f"drop={_pct(ladder.drop_pct)}% stage_gap={stage_no - 1} | rule2_sequential"
-    )
+def _buy_reason(*, stage_no: int, tick: Tick, trigger: int, ladder: Ladder,
+                state: StageState) -> str:
+    parts = [
+        f"stage={stage_no} BUY",
+        f"tick={tick.price}({tick.source.value}) <= trigger={trigger}",
+        f"anchor={ladder.anchor_price} drop={_pct(ladder.drop_pct)}% "
+        f"stage_gap={stage_no - 1}",
+        "rule2_sequential",
+    ]
+    if state.last_sold_at is not None:
+        parts.append(f"rebuy={state.rebuy_count} cooldown_ok")
+    return " | ".join(parts)
 
 
 def _sell_reason(
