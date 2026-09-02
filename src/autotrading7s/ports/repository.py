@@ -18,7 +18,7 @@ from typing import Protocol, runtime_checkable
 from autotrading7s.domain.cycle import Cycle
 from autotrading7s.domain.ladder import Ladder
 from autotrading7s.domain.stage import StageState
-from autotrading7s.domain.types import CloseReason, CycleStatus, OrderPath, Side
+from autotrading7s.domain.types import CycleStatus, OrderPath, Side
 
 
 class OrderLogNotFound(LookupError):
@@ -29,6 +29,19 @@ class OrderLogNotFound(LookupError):
     도 `TypeError` 도 아니므로 매핑 계층의 wrap/no-wrap 구분과 부딪치지
     않는다(매핑 계층은 이 예외를 보지 않는다: `update_order_log` 는 행을
     도메인 객체로 복원하지 않는다).
+    """
+
+
+class RowNotFound(LookupError):
+    """이름으로 지정한 행이 존재하지 않을 때 갱신 메서드가 낸다.
+
+    `save_cycle`·`set_config_status` 등, "존재하는 행을 갱신한다" 라고 약속한
+    메서드가 조용히 0행을 갱신하고 성공한 것처럼 반환하면 호출자는 상태
+    전이가 영속화됐다고 믿지만 DB 는 영영 다른 상태로 남는다 —
+    `update_order_log` 를 `OrderLogNotFound` 로 강화한 것과 같은 이유다.
+    테이블마다 예외를 따로 두지 않는다 — "이름 붙인 행이 없다" 는 모든
+    테이블에서 같은 사건이다. `LookupError` 를 상속한다 — `ValueError` 도
+    `TypeError` 도 아니므로 매핑 계층의 wrap/no-wrap 구분과 부딪치지 않는다.
     """
 
 
@@ -99,6 +112,37 @@ class HoldingRow:
     cycle_status: CycleStatus
 
 
+@dataclass(frozen=True, slots=True)
+class PendingOrderRow:
+    """`load_pending_orders` 가 반환하는 한 행 — 재시작 복구가 쓴다.
+
+    `load_pending_orders` 는 이 타입이 생기기 전에는 `dict(row)` 를 그대로
+    돌려줬다 — `sent_at` 이 `str` 로, `side`·`path`·`status` 가 맨 문자열로
+    새어나갔다. 다른 모든 읽기 경로는 `codec.text_to_dt` 를 거치므로 naive
+    시각을 거부하는데, 이 메서드만 그 경계를 건너뛰었다. 복구 로직(Plan 2B)이
+    바로 그 시각들로 쿨다운·타임아웃 산술을 하는 지점이므로, H2 가 지키려던
+    실패가 여기서 재현된다.
+
+    `status` 는 `str` 로 남긴다 — 스키마의 상태 어휘(`SENDING`·`ACCEPTED`·
+    `PARTIAL`·`FILLED`·`CANCELED`·`REJECTED`·`UNKNOWN`)에는 대응하는 도메인
+    enum 이 없다(`order_log` 는 도메인 객체로 복원되지 않는다).
+    """
+
+    order_log_id: int
+    client_ref: str
+    broker_order_id: str | None
+    cycle_id: int
+    stage_state_id: int | None
+    side: Side
+    path: OrderPath
+    req_price: int | None
+    req_qty: int
+    fill_price: int | None
+    fill_qty: int | None
+    status: str
+    sent_at: datetime
+
+
 @runtime_checkable
 class RepositoryPort(Protocol):
     # ── 설정 ────────────────────────────────────────────────────────────
@@ -106,12 +150,26 @@ class RepositoryPort(Protocol):
         """새 설정을 저장하고 id 를 반환. 같은 (stock_code, label) 은 UNIQUE 로 거부."""
         ...
 
-    def load_config(self, config_id: int) -> SplitConfig: ...
+    def load_config(self, config_id: int) -> SplitConfig:
+        """없는 `config_id` 는 `KeyError` 를 낸다.
+
+        복원된 행이 도메인 불변식을 어기면(`Ladder` 로 만들 수 없는
+        설정이면) `CorruptRowError` 를 낸다 — `DomainInvariantError` 의
+        하위이며 그것은 `ValueError` 의 하위다. 엔진 루프의 넓은
+        `except ValueError` 는 이것도 잡으므로, 그런 핸들러는 DB 손상을
+        평범한 입력 오류와 구분하지 못하고 삼킬 수 있다.
+        """
+        ...
 
     def list_configs(self) -> list[SplitConfig]: ...
 
-    def set_config_status(self, config_id: int, status: str) -> None:
-        """IDLE | ACTIVE."""
+    def set_config_status(self, config_id: int, status: str, *, at: datetime) -> None:
+        """IDLE | ACTIVE. 없는 `config_id` 는 `RowNotFound` 를 낸다.
+
+        `at` 은 갱신 시각이다 — 벽시계를 직접 읽지 않는다. `ports/clock.py`
+        가 존재하는 이유와 같다: "갭하락이 15:29에 오면?" 같은 시나리오가
+        재현 가능해야 한다.
+        """
         ...
 
     # ── 사이클과 단계 ───────────────────────────────────────────────────
@@ -119,9 +177,19 @@ class RepositoryPort(Protocol):
         """seq 를 자동 증가시켜 STARTING 사이클을 만든다."""
         ...
 
-    def load_cycle(self, cycle_id: int) -> Cycle: ...
+    def load_cycle(self, cycle_id: int) -> Cycle:
+        """없는 `cycle_id` 는 `KeyError` 를 낸다.
 
-    def save_cycle(self, cycle: Cycle) -> None: ...
+        복원된 행이 도메인 불변식을 어기면 `CorruptRowError` 를 낸다 —
+        `DomainInvariantError`(→ `ValueError`)의 하위다. `load_config` 의
+        같은 경고가 여기도 적용된다: 넓은 `except ValueError` 는 DB 손상을
+        삼킨다.
+        """
+        ...
+
+    def save_cycle(self, cycle: Cycle) -> None:
+        """없는 `cycle.cycle_id` 는 `RowNotFound` 를 낸다."""
+        ...
 
     def load_active_cycles(self) -> list[Cycle]:
         """CLOSED 가 아닌 사이클. 재시작 복구(Plan 2B)가 쓴다."""
@@ -131,6 +199,10 @@ class RepositoryPort(Protocol):
         """사이클의 **모든** 단계. 개수가 max_stages 와 다르면 거부한다(H3).
 
         각 단계의 trigger_price 를 사이클의 ladder_json 과 대조한다(H4).
+
+        완전성·대조 실패는 `CorruptRowError` 를 낸다 — `DomainInvariantError`
+        (→ `ValueError`)의 하위다. `load_config` 의 같은 경고가 여기도
+        적용된다.
         """
         ...
 
@@ -156,11 +228,25 @@ class RepositoryPort(Protocol):
 
         종결 상태에서의 역행, 이미 기록된 체결값의 덮어쓰기, `req_qty` 를 넘는
         `fill_qty` 는 `OrderLogInvariantError` 를 낸다.
+
+        **`fill_qty` 는 누적값이다, 증분이 아니다.** 매 호출의 `fill_qty` 는
+        그 주문이 지금까지 체결한 총 수량이어야 한다(부분체결이 이어질 때도
+        마찬가지) — 이전 값에 더할 값이 아니다. **`fill_price` 는 지금까지
+        모든 체결의 수량가중평균가다**, 마지막 체결의 가격이 아니다. 이
+        약속은 `BrokerPort.get_order`/`OrderStatus.filled_qty` 가 보고하는
+        값과 같은 것이어야 한다 — 브로커가 보고하는 그대로 여기 넘기면
+        맞아야 한다.
+
+        이 약속이 지켜지지 않으면 `realized_pnl_for_cycle` 이 틀린다 — 그
+        메서드는 `fill_price * fill_qty` 를 취득/처분 금액으로 직접 쓴다.
+        증분으로 잘못 채우면 총 매수량이 실제보다 커져 원가가 과소평가되고,
+        실현손익이 실제보다 크게 나온다 — 이 프로젝트가 이미 겪은 가장 심각한
+        결함(+399,200원 대 실제 +19,200원)과 같은 방향·같은 모양의 오류다.
         """
         ...
 
-    def load_pending_orders(self) -> list[dict[str, object]]:
-        """SENDING·ACCEPTED·UNKNOWN 상태의 주문. 재시작 복구가 쓴다."""
+    def load_pending_orders(self) -> list[PendingOrderRow]:
+        """SENDING·ACCEPTED·PARTIAL·UNKNOWN 상태의 주문. 재시작 복구가 쓴다."""
         ...
 
     def realized_pnl_for_cycle(self, cycle_id: int) -> int:

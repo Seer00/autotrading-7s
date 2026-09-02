@@ -16,7 +16,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime
 
-from autotrading7s.adapters.sqlite.codec import dt_to_text
+from autotrading7s.adapters.sqlite.codec import dt_to_text, text_to_dt
 from autotrading7s.adapters.sqlite.mapping import (
     config_to_row,
     cycle_to_row,
@@ -29,6 +29,8 @@ from autotrading7s.ports.repository import (
     HoldingRow,
     OrderLogInvariantError,
     OrderLogNotFound,
+    PendingOrderRow,
+    RowNotFound,
     SplitConfig,
 )
 from autotrading7s.domain.cycle import Cycle
@@ -65,12 +67,22 @@ class SqliteRepository:
         ).fetchall()
         return [row_to_config(dict(r)) for r in rows]
 
-    def set_config_status(self, config_id: int, status: str) -> None:
+    def set_config_status(self, config_id: int, status: str, *, at: datetime) -> None:
+        """없는 `config_id` 는 `RowNotFound` 를 낸다(Fix Round 3).
+
+        `at` 을 호출자가 넘긴다 — 벽시계(`datetime.now()`)를 읽지 않는다.
+        `src/` 전체에서 유일했던 `datetime.now()` 호출이 여기 있었다; 다른
+        모든 메서드는 시각을 매개변수로 받고, `ports/clock.py` 가 존재하는
+        것도 "갭하락이 15:29 에 오면?" 같은 시나리오를 재현 가능하게 하기
+        위해서다.
+        """
         with self._conn:
-            self._conn.execute(
+            cursor = self._conn.execute(
                 "UPDATE split_config SET status = ?, updated_at = ? WHERE id = ?",
-                (status, dt_to_text(datetime.now().astimezone()), config_id),
+                (status, dt_to_text(at), config_id),
             )
+            if cursor.rowcount == 0:
+                raise RowNotFound(f"no split_config row with id={config_id}")
 
     # ── 사이클 ──────────────────────────────────────────────────────────
     def create_cycle(self, config_id: int, started_at: datetime) -> Cycle:
@@ -99,19 +111,28 @@ class SqliteRepository:
         return row_to_cycle(dict(row))
 
     def save_cycle(self, cycle: Cycle) -> None:
-        """`cycle_to_row` 가 다루는 컬럼만 갱신한다.
+        """`cycle_to_row` 가 다루는 컬럼만 갱신한다. 없는 id 는 `RowNotFound`.
 
-        `realized_pnl` 은 Task 9(주문 이력·실현손익)가, `forced_close_reason`·
-        `forced_close_qty`(D20)는 Plan 2B 의 강제 종료가 채운다 — 여기서는
-        건드리지 않는다.
+        `realized_pnl` 은 Task 9(주문 이력·실현손익)가 채운다.
+
+        **D20 의 `forced_close_reason`·`forced_close_qty` 는 이 메서드로 쓸 수
+        없다.** `Cycle` 에 그 두 값을 담을 필드가 없고 `cycle_to_row` 도 그
+        컬럼을 다루지 않으므로, `close_reason=FORCED` 인 `Cycle` 을 넘기면
+        스키마의 D20 `CHECK` (증언과 잔량이 둘 다 있어야 한다)가 거부한다 —
+        `sqlite3.IntegrityError` 로 실패한다. Plan 2B 가 강제 종료 전이를
+        설계할 때 도메인 필드와 이 컬럼들의 쓰기 경로를 함께 추가해야 한다
+        (Fix Round 3 — 계약을 그 소비자보다 먼저 고정하지 않기 위해 이번
+        라운드에서는 일부러 추가하지 않았다).
         """
         row = cycle_to_row(cycle)
         assignments = ", ".join(f"{k} = :{k}" for k in row)
         with self._conn:
-            self._conn.execute(
+            cursor = self._conn.execute(
                 f"UPDATE cycle SET {assignments} WHERE id = :id",
                 row | {"id": cycle.cycle_id},
             )
+            if cursor.rowcount == 0:
+                raise RowNotFound(f"no cycle row with id={cycle.cycle_id}")
 
     def load_active_cycles(self) -> list[Cycle]:
         rows = self._conn.execute(
@@ -146,7 +167,11 @@ class SqliteRepository:
             )
 
     # ── 주문 이력 ───────────────────────────────────────────────────────
-    _PENDING_STATUSES = ("SENDING", "ACCEPTED", "UNKNOWN")
+    # PARTIAL 은 대기(pending) 쪽에 있어야 한다 — 부분체결 후 잔량이 여전히
+    # 브로커에서 살아있다. 이걸 빼면 재시작 복구가 그 주문을 못 보고, 실제로
+    # 진행 중인 주문이 유령처럼 사라진다(Fix Round 3 재현: PARTIAL·40주 체결·
+    # 105주 요청 후 load_pending_orders() 가 빈 목록을 반환했다).
+    _PENDING_STATUSES = ("SENDING", "ACCEPTED", "PARTIAL", "UNKNOWN")
 
     def append_order_log(
         self, *, client_ref: str, cycle_id: int, stage_state_id: int | None,
@@ -284,14 +309,38 @@ class SqliteRepository:
                  client_ref),
             )
 
-    def load_pending_orders(self) -> list[dict[str, object]]:
-        """SENDING·ACCEPTED·UNKNOWN 상태의 주문. 재시작 복구가 결말을 확인한다."""
+    def load_pending_orders(self) -> list[PendingOrderRow]:
+        """SENDING·ACCEPTED·PARTIAL·UNKNOWN 상태의 주문. 재시작 복구가 결말을
+        확인한다.
+
+        `dict(row)` 를 그대로 돌려주지 않는다(Fix Round 3) — `sent_at` 이
+        `str` 로, `side`·`path` 가 맨 문자열로 새어나가면 다른 모든 읽기
+        경로가 지키는 H2(tz-aware) 경계를 이 메서드만 건너뛴다. `status` 는
+        `str` 로 남긴다 — 대응하는 도메인 enum 이 없다.
+        """
         placeholders = ", ".join("?" for _ in self._PENDING_STATUSES)
         rows = self._conn.execute(
             f"SELECT * FROM order_log WHERE status IN ({placeholders}) ORDER BY id",
             self._PENDING_STATUSES,
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [
+            PendingOrderRow(
+                order_log_id=r["id"],
+                client_ref=r["client_ref"],
+                broker_order_id=r["broker_order_id"],
+                cycle_id=r["cycle_id"],
+                stage_state_id=r["stage_state_id"],
+                side=Side(r["side"]),
+                path=OrderPath(r["path"]),
+                req_price=r["req_price"],
+                req_qty=r["req_qty"],
+                fill_price=r["fill_price"],
+                fill_qty=r["fill_qty"],
+                status=r["status"],
+                sent_at=text_to_dt(r["sent_at"]),
+            )
+            for r in rows
+        ]
 
     def realized_pnl_for_cycle(self, cycle_id: int) -> int:
         """order_log 에서 집계한 실현손익 (H5).

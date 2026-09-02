@@ -6,10 +6,10 @@ from decimal import Decimal
 import pytest
 
 from autotrading7s.adapters.sqlite.mapping import CorruptRowError
-from autotrading7s.ports.repository import SplitConfig
+from autotrading7s.ports.repository import RowNotFound, SplitConfig
 from autotrading7s.adapters.sqlite.migrations import apply_schema, connect
 from autotrading7s.adapters.sqlite.repository import SqliteRepository
-from autotrading7s.domain.cycle import Cycle, confirm_anchor, start
+from autotrading7s.domain.cycle import Cycle, confirm_anchor
 from autotrading7s.domain.ladder import Ladder
 from autotrading7s.domain.stage import StageState, to_buy_pending, to_holding
 from autotrading7s.domain.types import CycleStatus, StageStatus
@@ -79,8 +79,23 @@ def test_same_stock_with_a_different_label_is_allowed(repo):
 
 def test_set_config_status(repo):
     config_id = repo.save_config(a_config())
-    repo.set_config_status(config_id, "ACTIVE")
+    repo.set_config_status(config_id, "ACTIVE", at=T0)
     assert repo.load_config(config_id).status == "ACTIVE"
+
+
+def test_set_config_status_raises_for_an_unknown_config_id(repo):
+    """Fix Round 3 — 없는 행을 조용히 갱신하지 않는다(update_order_log 와
+    같은 이유: 조용한 무동작은 호출자가 영속화됐다고 믿게 만든다)."""
+    with pytest.raises(RowNotFound):
+        repo.set_config_status(99_999, "ACTIVE", at=T0)
+
+
+def test_set_config_status_does_not_take_the_wall_clock(repo):
+    """`at` 을 명시적으로 넘겨야 한다 — datetime.now() 를 읽지 않는다."""
+    config_id = repo.save_config(a_config())
+    later = T0 + timedelta(days=1)
+    repo.set_config_status(config_id, "ACTIVE", at=later)
+    assert repo.load_config(config_id).updated_at == later
 
 
 def test_create_cycle_starts_at_seq_one_and_status_starting(repo):
@@ -108,6 +123,23 @@ def test_cycle_round_trip_through_the_database(repo):
     assert loaded.anchor_price == 10_000
     assert loaded.ladder is not None
     assert loaded.ladder.trigger_price(7) == a_ladder().trigger_price(7)
+
+
+def test_save_cycle_raises_for_an_unknown_cycle_id(repo):
+    """Fix Round 3 — save_cycle 도 update_order_log 와 같은 사전조건을 진다."""
+    config_id = repo.save_config(a_config())
+    ghost = Cycle(cycle_id=99_999, config_id=config_id, seq=1,
+                 status=CycleStatus.IDLE, started_at=T0)
+    with pytest.raises(RowNotFound):
+        repo.save_cycle(ghost)
+
+
+def test_save_cycle_still_succeeds_for_a_real_id(repo):
+    config_id = repo.save_config(a_config())
+    cycle = repo.create_cycle(config_id, started_at=T0)
+    cycle = confirm_anchor(cycle, anchor_price=10_000, ladder=a_ladder(), at=T0)
+    repo.save_cycle(cycle)  # 예외 없음
+    assert repo.load_cycle(cycle.cycle_id).status is CycleStatus.RUNNING
 
 
 def test_load_active_cycles_excludes_closed(repo):

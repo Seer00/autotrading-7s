@@ -6,13 +6,16 @@ from uuid import uuid4
 
 import pytest
 
-from autotrading7s.adapters.sqlite.mapping import SplitConfig
 from autotrading7s.adapters.sqlite.migrations import apply_schema, connect
 from autotrading7s.adapters.sqlite.repository import SqliteRepository
 from autotrading7s.domain.cycle import confirm_anchor
 from autotrading7s.domain.ladder import Ladder
 from autotrading7s.domain.types import OrderPath, Side
-from autotrading7s.ports.repository import OrderLogInvariantError, OrderLogNotFound
+from autotrading7s.ports.repository import (
+    OrderLogInvariantError,
+    OrderLogNotFound,
+    SplitConfig,
+)
 
 T0 = datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc)
 FIVE = Decimal("0.05")
@@ -53,8 +56,8 @@ def test_append_records_sending_status(repo_and_cycle):
     ref = an_order(repo, cycle_id, side=Side.BUY, req_price=9_500, req_qty=105)
     pending = repo.load_pending_orders()
     assert len(pending) == 1
-    assert pending[0]["client_ref"] == ref
-    assert pending[0]["status"] == "SENDING"
+    assert pending[0].client_ref == ref
+    assert pending[0].status == "SENDING"
 
 
 def test_duplicate_client_ref_is_refused(repo_and_cycle):
@@ -84,7 +87,62 @@ def test_unknown_status_stays_pending(repo_and_cycle):
     repo, cycle_id = repo_and_cycle
     ref = an_order(repo, cycle_id, side=Side.BUY, req_price=9_500, req_qty=105)
     repo.update_order_log(client_ref=ref, status="UNKNOWN")
-    assert [p["status"] for p in repo.load_pending_orders()] == ["UNKNOWN"]
+    assert [p.status for p in repo.load_pending_orders()] == ["UNKNOWN"]
+
+
+def test_partial_status_stays_pending(repo_and_cycle):
+    """Fix Round 3, Finding 1 — PARTIAL 은 SENDING·ACCEPTED·UNKNOWN 과 함께
+    대기(pending) 쪽에 있어야 한다. 105주 요청에 40주만 체결된 주문은 65주가
+    여전히 브로커에 살아 있으므로, 재시작 복구가 그 주문을 봐야 한다."""
+    repo, cycle_id = repo_and_cycle
+    ref = an_order(repo, cycle_id, side=Side.BUY, req_price=9_500, req_qty=105)
+    repo.update_order_log(client_ref=ref, status="PARTIAL", fill_price=9_500,
+                          fill_qty=40, settled_at=T0)
+    pending = repo.load_pending_orders()
+    assert [p.status for p in pending] == ["PARTIAL"]
+    assert pending[0].fill_qty == 40
+
+
+def test_pending_and_terminal_statuses_partition_the_schema_vocabulary():
+    """`_PENDING_STATUSES` 와 `_TERMINAL_STATUSES` 는 schema.sql 의 order_log
+    `status` CHECK 가 규정하는 7개 값을 정확히 둘로 나눠야 한다 — 겹치지도
+    않고, 빠지는 값도 없어야 한다(Fix Round 3, Finding 1: PARTIAL 이 둘
+    사이에 끼어 load_pending_orders() 가 부분체결 주문을 놓쳤다).
+
+    7개를 이 테스트에 그대로 나열하지 않고 schema.sql 에서 직접 뽑아온다 —
+    스키마가 상태를 하나 더 추가하는데 이 분류가 갱신되지 않으면 이 테스트가
+    깨져야 한다."""
+    import re
+
+    from autotrading7s.adapters.sqlite.migrations import _SCHEMA_PATH
+
+    schema_sql = _SCHEMA_PATH.read_text(encoding="utf-8")
+    match = re.search(
+        r"order_log.*?status TEXT NOT NULL CHECK\(status IN\s*\(([^)]+)\)\)",
+        schema_sql, re.S,
+    )
+    assert match is not None, "order_log.status CHECK 를 schema.sql 에서 못 찾음"
+    all_statuses = {s.strip().strip("'") for s in match.group(1).split(",")}
+
+    pending = set(SqliteRepository._PENDING_STATUSES)  # noqa: SLF001
+    terminal = set(SqliteRepository._TERMINAL_STATUSES)  # noqa: SLF001
+    assert pending & terminal == set(), "PENDING·TERMINAL 이 겹친다"
+    assert pending | terminal == all_statuses, "분류가 스키마의 상태 전체를 덮지 못한다"
+
+
+def test_load_pending_orders_decodes_through_the_codec(repo_and_cycle):
+    """Fix Round 3, Finding 2 — `dict(row)` 를 그대로 돌려주면 `sent_at` 이
+    naive `str` 로, `side`·`path` 가 맨 문자열로 새어나간다. 다른 모든 읽기
+    경로가 지키는 H2(tz-aware) 경계를 이 메서드도 지켜야 한다."""
+    repo, cycle_id = repo_and_cycle
+    an_order(repo, cycle_id, side=Side.BUY, req_price=9_500, req_qty=105)
+    pending = repo.load_pending_orders()
+    assert len(pending) == 1
+    row = pending[0]
+    assert isinstance(row.sent_at, datetime)
+    assert row.sent_at.tzinfo is not None
+    assert row.side is Side.BUY
+    assert row.path is OrderPath.TRIGGER
 
 
 def test_a_trigger_path_market_order_is_refused(repo_and_cycle):
@@ -291,3 +349,29 @@ def test_update_order_log_allows_fill_qty_equal_to_req_qty(repo_and_cycle):
     repo.update_order_log(client_ref=ref, status="FILLED", fill_price=10_000,
                           fill_qty=100, settled_at=T0)  # 예외 없음
     assert repo.realized_pnl_for_cycle(cycle_id) == -10_000 * 100
+
+
+# ── Fix Round 3, Finding 11: fill_qty 는 누적값이다, 증분이 아니다 ─────────
+
+def test_fill_qty_is_cumulative_not_incremental(repo_and_cycle):
+    """`update_order_log` 의 `fill_qty` 는 그 주문이 지금까지 체결한 총
+    수량으로 채워야 한다 — 이 계약이 지켜지지 않고 매 부분체결 이벤트의
+    수량을 그대로(증분으로) 넘기면 총 매수량이 실제보다 커져 원가가
+    과소평가되고 실현손익이 과대평가된다. 여기서는 PARTIAL(40주) 뒤에
+    FILLED(누적 105주)로 갱신한 뒤, "증분으로 읽었다면" 나올 값(40+105=145주
+    매수)과 실제(누적, 105주 매수) 답이 다름을 보여, 이 리포지토리가 실제로
+    누적 값으로 집계함을 고정한다."""
+    repo, cycle_id = repo_and_cycle
+    ref = an_order(repo, cycle_id, side=Side.BUY, req_price=9_500, req_qty=105)
+    repo.update_order_log(client_ref=ref, status="PARTIAL", fill_price=9_500,
+                          fill_qty=40, settled_at=T0)
+    repo.update_order_log(client_ref=ref, status="FILLED", fill_price=9_500,
+                          fill_qty=105, settled_at=T0)  # 누적 105주 — 증분 아님
+    _filled(repo, cycle_id, side=Side.SELL, price=9_980, qty=105)
+
+    actual = repo.realized_pnl_for_cycle(cycle_id)
+    naive_incremental = 9_980 * 105 - 9_500 * (40 + 105)  # 잘못된 읽기라면 이 값
+    correct_cumulative = 9_980 * 105 - 9_500 * 105
+
+    assert actual != naive_incremental
+    assert actual == correct_cumulative

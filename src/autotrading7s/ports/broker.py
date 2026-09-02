@@ -40,7 +40,16 @@ class BrokerPort(Protocol):
 
     async def cancel_order(self, broker_order_id: str) -> CancelAck: ...
 
-    async def get_order(self, broker_order_id: str) -> OrderStatus: ...
+    async def get_order(self, broker_order_id: str) -> OrderStatus:
+        """이 주문의 현재 체결 상태.
+
+        `OrderStatus.filled_qty` 는 **누적값**이다 — 이 주문이 지금까지
+        체결한 총 수량이며, 마지막 조회 이후의 증분이 아니다.
+        `OrderStatus.filled_price` 는 지금까지 모든 체결의 **수량가중평균가**
+        다, 가장 최근 체결의 가격이 아니다. `RepositoryPort.update_order_log`
+        의 `fill_qty`·`fill_price` 는 이 값을 그대로 받아 쓰도록 되어 있다.
+        """
+        ...
 
     async def list_orders_today(self, code: str | None) -> list[OrderStatus]:
         """당일 주문 내역. 설계서 9절의 UNKNOWN 분기가 client_ref 대조에 쓴다."""

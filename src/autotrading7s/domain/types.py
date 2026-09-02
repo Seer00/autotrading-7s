@@ -143,6 +143,16 @@ class CancelAck:
 
 @dataclass(frozen=True, slots=True)
 class OrderStatus:
+    """`BrokerPort.get_order`/`list_orders_today` 가 보고하는 주문 상태.
+
+    `filled_qty` 는 **누적값**이다 — 이 주문이 지금까지 체결한 총 수량이며,
+    직전 조회 이후의 증분이 아니다. `filled_price` 는 지금까지 모든 체결의
+    **수량가중평균가**다, 가장 최근 체결의 가격이 아니다. 이 값들을 증분·
+    최종가로 잘못 읽으면 원가가 실제보다 작게 잡혀 실현손익이 실제보다 크게
+    보인다 — `RepositoryPort.update_order_log`(`fill_qty`·`fill_price`)로
+    그대로 넘길 때 이 약속이 그쪽 계약과 일치해야 한다.
+    """
+
     client_ref: UUID
     broker_order_id: str
     state: FillState
