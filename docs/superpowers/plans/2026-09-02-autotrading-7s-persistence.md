@@ -17,7 +17,7 @@
 설계서와 Plan 1의 전역 제약. 모든 태스크의 요구사항에 암묵적으로 포함된다.
 
 - **Python 3.12** 이상. `from __future__ import annotations` 를 모듈 docstring 직후 첫 import로 둔다.
-- **`domain/` 패키지는 표준 라이브러리 외 어떤 것도 import 하지 않는다.** 이 계획은 `domain/`을 두 곳만 건드린다(Task 1의 `errors.py` 신설과 예외 타입 전환) — 그때도 이 규칙을 지킨다. `tests/test_g1_gate.py`의 AST 테스트가 이를 자동 검증한다.
+- **`domain/` 패키지는 표준 라이브러리 외 어떤 것도 import 하지 않는다.** 이 계획은 `domain/`을 세 곳만 건드린다(Task 1의 `errors.py` 신설과 예외 타입 전환, Task 6의 `CloseReason.FORCED` 멤버 추가) — 그때도 이 규칙을 지킨다. `tests/test_g1_gate.py`의 AST 테스트가 이를 자동 검증한다.
 - **`adapters/`는 `ports/`와 `domain/`에 의존하고, 그 반대는 없다.** 화살표는 항상 안쪽을 향한다(설계서 7.2절).
 - **금액·가격은 원 단위 `int`, 비율만 `Decimal`.** `float`를 금액 계산에 쓰는 것을 금지한다. SQLite는 `Decimal`을 모르므로 **TEXT로 저장**한다(설계서 12.1절).
 - **도메인의 모든 `datetime`은 tz-aware여야 한다.** SQLite TEXT에서 파싱할 때 tzinfo를 잃지 않아야 한다 — Plan 1이 Task 9에서 확인한 실패 모드는 naive와 aware를 빼면 엔진 틱 루프 안에서 `TypeError`가 터지는 것이다.
@@ -1426,7 +1426,16 @@ git commit -m "$(printf 'feat: Decimal·datetime 의 TEXT 왕복 코덱\n\nSQLit
 
 **Files:**
 - Create: `src/autotrading7s/adapters/sqlite/mapping.py`
+- Modify: `src/autotrading7s/domain/types.py` — `CloseReason` 에 `FORCED` 멤버 추가
 - Test: `tests/adapters/sqlite/test_mapping_config_cycle.py`
+
+**`CloseReason.FORCED` 를 여기서 추가한다.** Task 4 의 스키마가 이미
+`close_reason IN ('NORMAL','EMERGENCY','FORCED')` 를 허용하고 설계서 D20 이 그 값을
+정의하는데, 도메인 enum 에는 없었다 — 이 계획의 초안이 빠뜨린 것이다. 저장된
+`FORCED` 행을 복원하려면 매핑 계층에 그 멤버가 있어야 한다. 그 값을 *만드는* 상태
+전이(`force_close`)는 Plan 2B 에 남는다 — 여기서 추가하는 것은 멤버뿐이며 새 동작이
+없다. 정상 `close()` 경로로 `FORCED` 를 만드는 오용은 D20 의 스키마 CHECK
+(`FORCED` 는 `forced_close_reason`·`forced_close_qty` 가 둘 다 있어야 한다)가 막는다.
 
 **Interfaces:**
 - Consumes: `codec` (Task 5), `SplitConfig` (Task 3 — `ports/repository.py`), `Ladder`·`LadderConfigError` (`domain/ladder.py`), `Cycle`·`CycleStatus`·`CloseReason` (`domain/cycle.py`, `domain/types.py`), `DomainInvariantError` (Task 1)
