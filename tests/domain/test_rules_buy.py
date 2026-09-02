@@ -50,9 +50,11 @@ def tick(price: int, source: TickSource = TickSource.WS) -> Tick:
     return Tick(code="005930", price=price, at=T0, source=source)
 
 
-def run(price: int, states, cycle=None, market_open=True, now=T0, params=PARAMS):
+def run(price: int, states, cycle=None, market_open=True, now=T0, params=PARAMS,
+        stock_code: str = "005930"):
     return decide(tick=tick(price), cycle=cycle or running_cycle(),
-                  states=states, params=params, now=now, market_open=market_open)
+                  states=states, params=params, now=now, market_open=market_open,
+                  stock_code=stock_code)
 
 
 def test_buys_next_stage_when_trigger_reached():
@@ -127,7 +129,7 @@ def test_no_decision_while_starting():
     starting = start(idle, at=T0)
     lad = ladder()
     assert decide(tick=tick(8_400), cycle=starting, states=fresh_states(lad),
-                  params=PARAMS, now=T0, market_open=True) == []
+                  params=PARAMS, now=T0, market_open=True, stock_code="005930") == []
 
 
 def test_no_decision_while_paused():
@@ -148,5 +150,156 @@ def test_reason_records_trigger_basis():
 def test_reason_records_rest_poll_source():
     lad = ladder()
     d = decide(tick=tick(9_500, TickSource.REST_POLL), cycle=running_cycle(lad),
-               states=fresh_states(lad), params=PARAMS, now=T0, market_open=True)[0]
+               states=fresh_states(lad), params=PARAMS, now=T0, market_open=True,
+               stock_code="005930")[0]
     assert "tick=9500(REST_POLL)" in d.reason
+
+
+# Finding 1: Wrong instrument detection
+def test_wrong_stock_code_raises_value_error():
+    """FINDING 1: decide() must detect a tick for the wrong instrument."""
+    lad = ladder()
+    with pytest.raises(ValueError) as exc_info:
+        run(9_500, fresh_states(lad), stock_code="035720")
+    assert "005930" in str(exc_info.value)
+    assert "035720" in str(exc_info.value)
+
+
+def test_wrong_stock_code_raises_even_when_market_closed():
+    """FINDING 1: Stock code check happens before market_open gate."""
+    lad = ladder()
+    with pytest.raises(ValueError):
+        run(9_500, fresh_states(lad), market_open=False, stock_code="035720")
+
+
+def test_matching_stock_code_still_works():
+    """FINDING 1: Matching code proceeds normally."""
+    lad = ladder()
+    decisions = run(9_500, fresh_states(lad), stock_code="005930")
+    assert len(decisions) == 1
+
+
+# Finding 2: Tick price validation
+def test_tick_price_zero_raises_value_error():
+    """FINDING 2: Tick price must be positive."""
+    with pytest.raises(ValueError) as exc_info:
+        Tick(code="005930", price=0, at=T0, source=TickSource.WS)
+    assert "positive" in str(exc_info.value).lower() or "0" in str(exc_info.value)
+
+
+def test_tick_price_negative_raises_value_error():
+    """FINDING 2: Tick price must be positive."""
+    with pytest.raises(ValueError) as exc_info:
+        Tick(code="005930", price=-5000, at=T0, source=TickSource.WS)
+    assert "positive" in str(exc_info.value).lower() or "-5000" in str(exc_info.value)
+
+
+def test_tick_price_float_raises_type_error():
+    """FINDING 2: Tick price must be int, not float."""
+    with pytest.raises(TypeError) as exc_info:
+        Tick(code="005930", price=9340.5, at=T0, source=TickSource.WS)
+    assert "int" in str(exc_info.value).lower()
+
+
+def test_tick_price_bool_raises_type_error():
+    """FINDING 2: bool is rejected even though it's technically an int subclass."""
+    with pytest.raises(TypeError) as exc_info:
+        Tick(code="005930", price=True, at=T0, source=TickSource.WS)
+    assert "int" in str(exc_info.value).lower()
+
+
+# Finding 3: Duplicate stage_no detection
+def test_duplicate_stage_no_raises_value_error():
+    """FINDING 3: Passing states with two entries for same stage_no raises ValueError."""
+    lad = ladder()
+    states = fresh_states(lad)
+    # Add a duplicate entry for stage 2
+    states.append(
+        StageState(stage_no=2, status=StageStatus.WAITING,
+                   trigger_price=9_500, planned_qty=105)
+    )
+    with pytest.raises(ValueError) as exc_info:
+        run(9_500, states)
+    assert "2" in str(exc_info.value) or "duplicate" in str(exc_info.value).lower()
+
+
+def test_duplicate_stage_no_raises_even_when_market_closed():
+    """FINDING 3: Duplicate check happens before market_open gate."""
+    lad = ladder()
+    states = fresh_states(lad)
+    states.append(
+        StageState(stage_no=2, status=StageStatus.WAITING,
+                   trigger_price=9_500, planned_qty=105)
+    )
+    with pytest.raises(ValueError):
+        run(9_500, states, market_open=False)
+
+
+# Finding 5: TriggerParams validation
+def test_trigger_params_zero_target_pct_raises():
+    """FINDING 5: target_pct must be positive."""
+    with pytest.raises(ValueError) as exc_info:
+        TriggerParams(target_pct=Decimal("0"))
+    assert "positive" in str(exc_info.value).lower() or "0" in str(exc_info.value)
+
+
+def test_trigger_params_negative_target_pct_raises():
+    """FINDING 5: target_pct must be positive."""
+    with pytest.raises(ValueError) as exc_info:
+        TriggerParams(target_pct=Decimal("-0.05"))
+    assert "positive" in str(exc_info.value).lower()
+
+
+def test_trigger_params_negative_cooldown_raises():
+    """FINDING 5: rebuy_cooldown_sec must be non-negative."""
+    with pytest.raises(ValueError) as exc_info:
+        TriggerParams(target_pct=FIVE, rebuy_cooldown_sec=-1)
+    assert "non-negative" in str(exc_info.value).lower() or "-1" in str(exc_info.value)
+
+
+def test_trigger_params_valid_defaults_construct():
+    """FINDING 5: Valid defaults still work."""
+    params = TriggerParams(target_pct=FIVE)
+    assert params.target_pct == FIVE
+    assert params.allow_rebuy is True
+    assert params.rebuy_cooldown_sec == 60
+
+
+# Finding 6: target_pct mismatch between ladder and params
+def test_target_pct_mismatch_raises():
+    """FINDING 6: Ladder and params target_pct must match."""
+    lad_5pct = ladder(anchor=10_000)  # Has 5% target_pct
+    cycle = running_cycle(lad_5pct)
+
+    params_3pct = TriggerParams(target_pct=Decimal("0.03"))
+
+    with pytest.raises(ValueError) as exc_info:
+        decide(tick=tick(9_500), cycle=cycle, states=fresh_states(lad_5pct),
+               params=params_3pct, now=T0, market_open=True, stock_code="005930")
+
+    assert "5%" in str(exc_info.value) or "3%" in str(exc_info.value) or "target_pct" in str(exc_info.value).lower()
+
+
+def test_target_pct_match_proceeds():
+    """FINDING 6: Matching target_pct proceeds normally."""
+    lad = ladder()  # 5%
+    cycle = running_cycle(lad)
+    params = TriggerParams(target_pct=FIVE)  # 5%
+
+    decisions = decide(tick=tick(9_500), cycle=cycle, states=fresh_states(lad),
+                       params=params, now=T0, market_open=True, stock_code="005930")
+    assert len(decisions) == 1
+
+
+def test_starting_cycle_with_mismatched_target_pct_returns_empty():
+    """FINDING 6: STARTING cycle returns [] before mismatch check (gate 4 fires first)."""
+    idle = Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.IDLE)
+    starting = start(idle, at=T0)
+    lad = ladder()
+
+    params_3pct = TriggerParams(target_pct=Decimal("0.03"))
+
+    result = decide(tick=tick(9_500), cycle=starting, states=fresh_states(lad),
+                    params=params_3pct, now=T0, market_open=True, stock_code="005930")
+    # Should return [] because cycle.ladder is None (gate 4), not raise (gate 6)
+    assert result == []

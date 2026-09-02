@@ -67,6 +67,12 @@ class Tick:
     at: datetime
     source: TickSource
 
+    def __post_init__(self) -> None:
+        if isinstance(self.price, bool) or not isinstance(self.price, int):
+            raise TypeError(f"price must be int, not {type(self.price).__name__}")
+        if self.price <= 0:
+            raise ValueError(f"price must be positive: {self.price}")
+
 
 @dataclass(frozen=True, slots=True)
 class LimitOrderRequest:

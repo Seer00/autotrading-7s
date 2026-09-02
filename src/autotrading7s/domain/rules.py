@@ -30,6 +30,12 @@ class TriggerParams:
     allow_rebuy: bool = True
     rebuy_cooldown_sec: int = 60
 
+    def __post_init__(self) -> None:
+        if self.target_pct <= 0:
+            raise ValueError(f"target_pct must be positive: {self.target_pct}")
+        if self.rebuy_cooldown_sec < 0:
+            raise ValueError(f"rebuy_cooldown_sec must be non-negative: {self.rebuy_cooldown_sec}")
+
 
 @dataclass(frozen=True, slots=True)
 class BuyStage:
@@ -58,8 +64,24 @@ def decide(
     params: TriggerParams,
     now: datetime,
     market_open: bool,
+    stock_code: str,
 ) -> list[Decision]:
     """이 틱에 집행할 결정 목록. 부작용 없음."""
+    # 프로그래밍 오류와 데이터 오류는 조용히 무시할 수 없다.
+    # 이 검사들(1–2, 5)은 시장시간과 무관하게 진행한다.
+    if tick.code != stock_code:
+        raise ValueError(f"Tick code mismatch: tick has {tick.code!r}, "
+                        f"but stock_code is {stock_code!r}")
+
+    # 검사 3: 상태 목록의 중복 stage_no 감지
+    by_no = {s.stage_no: s for s in states}
+    if len(by_no) != len(states):
+        seen: set[int] = set()
+        for s in states:
+            if s.stage_no in seen:
+                raise ValueError(f"Duplicate stage_no in states: {s.stage_no}")
+            seen.add(s.stage_no)
+
     # 규칙 4 — 장 운영시간 밖에서는 어떤 결정도 내리지 않는다.
     if not market_open:
         return []
@@ -67,6 +89,12 @@ def decide(
     # 계산할 수 없고, PAUSED·LIQUIDATING 은 자동 트리거가 정지된 상태다.
     if not cycle.accepts_triggers or cycle.ladder is None:
         return []
+
+    # 검사 6: 사다리와 매개변수의 target_pct 일치 확인
+    if cycle.ladder.target_pct != params.target_pct:
+        raise ValueError(f"target_pct mismatch: ladder has "
+                        f"{cycle.ladder.target_pct}, "
+                        f"params has {params.target_pct}")
 
     buy = _eval_buy(tick, cycle.ladder, states, params, now)
     return [buy] if buy is not None else []
