@@ -44,6 +44,40 @@ class FillMode(Enum):
     NEVER = "NEVER"
 
 
+class BrokerTimeout(Exception):
+    """브로커가 응답하지 않았다.
+
+    `TimeoutError` 를 상속하지 않는다. `asyncio.wait_for` 가 `TimeoutError` 를
+    던지므로, 상속하면 엔진의 `except BrokerTimeout` 이 asyncio 자체의 타임아웃까지
+    잡는다. 둘은 다른 사건이다 — 이것은 브로커가 답하지 않은 것이고, 그것은 우리
+    쪽 대기 한도를 넘긴 것이다.
+
+    **이 예외를 받았을 때 재발주해서는 안 된다.** 요청이 서버에 도달했는지 알 수
+    없고, 도달했을 수도 있다. 설계서 9절 ⑤ 가 규정한 유일한 안전한 행동은
+    `list_orders_today` 로 `client_ref` 를 대조해 사실을 확인하는 것이다.
+    """
+
+
+class BrokerRejected(Exception):
+    """브로커가 명시적으로 거부했다. 타임아웃과 달리 미접수가 확실하다."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
+
+
+class BrokerDisconnected(Exception):
+    """시세 스트림이 끊겼다. 설계서 8.4절의 REST 폴백이 여기서 시작된다."""
+
+
+class FailMode(Enum):
+    NONE = "NONE"
+    TIMEOUT = "TIMEOUT"
+    REJECT = "REJECT"
+    DISCONNECT = "DISCONNECT"
+
+
 @dataclass
 class _Order:
     broker_order_id: str
@@ -68,6 +102,8 @@ class FakeBroker:
         partial_ratio: Decimal = Decimal("0.4"),
         delay_ticks: int = 3,
         cash: int = 100_000_000,
+        fail_mode: FailMode = FailMode.NONE,
+        fail_after: int = 0,
     ) -> None:
         if not script:
             raise ValueError("script must not be empty")
@@ -81,6 +117,21 @@ class FakeBroker:
         self._positions: dict[str, tuple[int, int]] = {}   # code → (qty, 취득원가합)
         self._ticks_consumed = 0
         self._next_id = 1
+        self._fail_mode = fail_mode
+        self._fail_after = fail_after
+        self._calls = 0
+
+    def clear_failure(self) -> None:
+        """실패 모드를 해제한다. 재연결·재시도 시나리오에 쓴다."""
+        self._fail_mode = FailMode.NONE
+        self._calls = 0
+
+    def _should_fail(self) -> bool:
+        """fail_after 번째 호출까지는 통과시키고 그 다음부터 실패한다."""
+        if self._fail_mode is FailMode.NONE:
+            return False
+        self._calls += 1
+        return self._calls > self._fail_after
 
     # ── 시세 ────────────────────────────────────────────────────────────
     def subscribe_quotes(self, codes: list[str]) -> AsyncIterator[Tick]:
@@ -88,6 +139,12 @@ class FakeBroker:
 
     async def _replay(self) -> AsyncIterator[Tick]:
         for price in self._script[self._ticks_consumed:]:
+            if (self._fail_mode is FailMode.DISCONNECT
+                    and self._ticks_consumed >= self._fail_after):
+                # 끊김은 `_should_fail` 을 쓰지 않는다 — 틱 소비 수를 기준으로
+                # 해야 결정론적이고, 재구독 후 남은 틱이 이어지려면 호출 카운터가
+                # 아니라 소비된 틱 수로 판정해야 한다.
+                raise BrokerDisconnected("stream lost (simulated)")
             self._ticks_consumed += 1
             self._settle_delayed()
             yield Tick(
@@ -116,6 +173,26 @@ class FakeBroker:
     def _accept(
         self, client_ref: UUID, code: str, side: Side, qty: int, price: int | None
     ) -> OrderAck:
+        if self._should_fail():
+            if self._fail_mode is FailMode.REJECT:
+                # 명시적 거부는 주문을 등록하지 않는다 — 미접수가 확실하다.
+                raise BrokerRejected("40510", "주문 거부 (시뮬레이션)")
+            if self._fail_mode is FailMode.TIMEOUT:
+                # 타임아웃은 등록한 뒤 던진다. 실제 타임아웃의 성질이 그렇고,
+                # 설계서 9절 ⑤ 의 "접수됨" 분기를 테스트할 수 있게 하는 장치다.
+                self._register(client_ref, code, side, qty, price)
+                raise BrokerTimeout("no response from broker (simulated)")
+            if self._fail_mode is FailMode.DISCONNECT:
+                raise BrokerDisconnected("stream lost (simulated)")
+        return OrderAck(
+            client_ref=client_ref,
+            broker_order_id=self._register(client_ref, code, side, qty, price),
+            accepted_at=_EPOCH,
+        )
+
+    def _register(
+        self, client_ref: UUID, code: str, side: Side, qty: int, price: int | None
+    ) -> str:
         broker_order_id = f"FAKE-{self._next_id}"
         self._next_id += 1
         order = _Order(
@@ -135,8 +212,7 @@ class FakeBroker:
             order.fill_at_tick = self._ticks_consumed + self._delay_ticks
         # NEVER 는 아무것도 하지 않는다 — OPEN 으로 남는다.
 
-        return OrderAck(client_ref=client_ref, broker_order_id=broker_order_id,
-                        accepted_at=_EPOCH)
+        return broker_order_id
 
     def _fill(self, order: _Order, qty: int) -> None:
         price = order.price if order.price is not None else self._current_price()
@@ -189,6 +265,9 @@ class FakeBroker:
     async def get_balance(self) -> Balance:
         """예수금과 보유종목.
 
+        `fail_mode` 가 `TIMEOUT` 이면 실패 카운터가 `fail_after` 를 넘긴 뒤부터
+        타임아웃한다 — 설계서 10.2절의 대사가 잔고 조회 실패도 다뤄야 하므로.
+
         전량 매도된 종목은 `_positions` 에서 지우지 않고 `qty=0` 인 항목으로
         남긴다 — "응답에 없음"이 아니라 "보유 0"을 뜻한다. `Balance.qty_of` 는
         두 경우 모두 0 을 반환해 호출부에서 구별이 안 되지만(Plan 1 최종 리뷰
@@ -196,6 +275,8 @@ class FakeBroker:
         일부러 "보유 0" 쪽을 만든다. "응답에 없음"을 재현하려면 `_positions`
         에서 항목을 지우는 별도 경로가 필요하며 현재는 만들지 않았다.
         """
+        if self._should_fail() and self._fail_mode is FailMode.TIMEOUT:
+            raise BrokerTimeout("no response from broker (simulated)")
         holdings = tuple(
             Holding(code=code, qty=qty,
                     avg_price=0 if qty == 0 else cost // qty)
