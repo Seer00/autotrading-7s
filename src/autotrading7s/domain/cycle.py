@@ -22,7 +22,7 @@ class IllegalCycleTransition(RuntimeError):
 
 _ALLOWED: dict[CycleStatus, frozenset[CycleStatus]] = {
     CycleStatus.IDLE: frozenset({CycleStatus.STARTING}),
-    CycleStatus.STARTING: frozenset({CycleStatus.RUNNING, CycleStatus.IDLE}),
+    CycleStatus.STARTING: frozenset({CycleStatus.RUNNING, CycleStatus.IDLE, CycleStatus.LIQUIDATING}),
     CycleStatus.RUNNING: frozenset(
         {CycleStatus.PAUSED, CycleStatus.LIQUIDATING, CycleStatus.CLOSED}
     ),
@@ -47,6 +47,35 @@ class Cycle:
     close_reason: CloseReason | None = None
     started_at: datetime | None = None
     closed_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        # FINDING A: 상태별 필드 불변량 검사.
+        # RUNNING, PAUSED 상태는 앵커와 사다리가 반드시 필요하다.
+        # LIQUIDATING은 STARTING에서도 들어올 수 있으므로 (사용자 긴급 취소),
+        # 앵커가 있을 때만 검사한다.
+        if self.status in (CycleStatus.RUNNING, CycleStatus.PAUSED):
+            if self.anchor_price is None:
+                raise ValueError(
+                    f"Cycle status {self.status.value} requires anchor_price, got None"
+                )
+            if self.ladder is None:
+                raise ValueError(
+                    f"Cycle status {self.status.value} requires ladder, got None"
+                )
+            if self.anchor_price != self.ladder.anchor_price:
+                raise ValueError(
+                    f"anchor_price {self.anchor_price} != ladder.anchor_price {self.ladder.anchor_price}"
+                )
+        elif self.status is CycleStatus.LIQUIDATING and self.anchor_price is not None:
+            # LIQUIDATING에 anchor_price가 있으면 ladder도 있어야 하고 일치해야 한다
+            if self.ladder is None:
+                raise ValueError(
+                    f"Cycle status LIQUIDATING with anchor_price requires ladder, got None"
+                )
+            if self.anchor_price != self.ladder.anchor_price:
+                raise ValueError(
+                    f"anchor_price {self.anchor_price} != ladder.anchor_price {self.ladder.anchor_price}"
+                )
 
     @property
     def is_active(self) -> bool:
@@ -116,8 +145,16 @@ def begin_liquidation(cycle: Cycle) -> Cycle:
     return replace(cycle, status=CycleStatus.LIQUIDATING)
 
 
-def close(cycle: Cycle, *, reason: CloseReason, at: datetime) -> Cycle:
+def close(
+    cycle: Cycle, *, reason: CloseReason, at: datetime, states: Sequence[StageState]
+) -> Cycle:
+    """사이클을 종료 상태로 전이. FINDING C: 사이클이 실제로 종료되었음을 검증."""
     _guard(cycle, CycleStatus.CLOSED)
+    if not is_cycle_complete(states):
+        held = sum(s.held_qty for s in states)
+        raise ValueError(
+            f"cannot close cycle with {held} shares still held — not all stages complete"
+        )
     return replace(cycle, status=CycleStatus.CLOSED, close_reason=reason, closed_at=at)
 
 
@@ -126,7 +163,11 @@ def is_cycle_complete(states: Sequence[StageState]) -> bool:
 
     설계서 4.2절은 '보유수량 0 도달'을 종료 조건으로 규정한다. PENDING 주문이
     남아 있으면 곧 보유가 생길 수 있으므로 종료로 보지 않는다.
+
+    FINDING B: 빈 단계 리스트는 데이터 무결성 실패다. ValueError를 던진다.
     """
+    if not states:
+        raise ValueError("stage states sequence is empty — data integrity failure")
     pending = (StageStatus.BUY_PENDING, StageStatus.SELL_PENDING)
     if any(s.status in pending for s in states):
         return False
