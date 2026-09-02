@@ -12,7 +12,7 @@ H3(완전한 단계 집합), H4(trigger_price 대조). H2(tz-aware)는 codec 이
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from autotrading7s.adapters.sqlite.codec import (
@@ -26,7 +26,8 @@ from autotrading7s.adapters.sqlite.codec import (
 from autotrading7s.domain.cycle import Cycle
 from autotrading7s.domain.errors import DomainInvariantError
 from autotrading7s.domain.ladder import Ladder
-from autotrading7s.domain.types import CloseReason, CycleStatus
+from autotrading7s.domain.stage import StageState
+from autotrading7s.domain.types import CloseReason, CycleStatus, StageStatus
 from autotrading7s.ports.repository import SplitConfig
 
 
@@ -166,3 +167,107 @@ def row_to_cycle(row: Mapping[str, Any]) -> Cycle:
         # CycleStatus·CloseReason 의 알 수 없는 값도 ValueError 이며, 그것 역시
         # 행 손상이다. DomainInvariantError 는 ValueError 의 하위이므로 함께 잡힌다.
         raise _corrupt("cycle", rowid, exc) from exc
+
+
+def stage_to_row(cycle_id: int, stage: StageState) -> dict[str, Any]:
+    return {
+        "cycle_id": cycle_id,
+        "stage_no": stage.stage_no,
+        "status": stage.status.value,
+        "trigger_price": stage.trigger_price,
+        "planned_qty": stage.planned_qty,
+        "fill_price": stage.fill_price,
+        "fill_qty": stage.fill_qty,
+        "bought_at": None if stage.bought_at is None else dt_to_text(stage.bought_at),
+        "last_sold_at": (
+            None if stage.last_sold_at is None else dt_to_text(stage.last_sold_at)
+        ),
+        "rebuy_count": stage.rebuy_count,
+    }
+
+
+def row_to_stage(row: Mapping[str, Any]) -> StageState:
+    rowid = row.get("id")
+    try:
+        bought = row["bought_at"]
+        sold = row["last_sold_at"]
+        return StageState(
+            stage_no=row["stage_no"],
+            status=StageStatus(row["status"]),
+            trigger_price=row["trigger_price"],
+            planned_qty=row["planned_qty"],
+            fill_price=row["fill_price"],
+            fill_qty=row["fill_qty"],
+            bought_at=None if bought is None else text_to_dt(bought),
+            last_sold_at=None if sold is None else text_to_dt(sold),
+            rebuy_count=row["rebuy_count"],
+        )
+    except ValueError as exc:
+        raise _corrupt("stage_state", rowid, exc) from exc
+
+
+def rows_to_stages(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    cycle_id: int,
+    ladder: Ladder | None,
+) -> list[StageState]:
+    """사이클의 단계 집합을 복원한다. 항상 완전한 집합만 반환한다.
+
+    **H3 — 완전성.** `decide()` 는 없는 단계를 조용히 건너뛰므로(Plan 1 Task 7 의
+    판단), 리포지토리가 완전성을 진다. 도메인은 부분 목록을 계속 허용하고 이
+    함수는 완전한 것만 준다. `ladder` 가 있으면 기대 개수는 `ladder.max_stages`
+    이고, 없으면(STARTING 사이클) 1부터의 연속성과 중복 부재만 본다.
+
+    **H4 — trigger_price 대조.** 설계서 4.2절이 같은 숫자를 `cycle.ladder_json` 과
+    `stage_state.trigger_price` 두 곳에 쓰지만 스키마가 둘을 묶지 않는다. Plan 1 의
+    최종 리뷰가 재현한 손상은 `trigger_price=999_999` 인 행이 앵커보다 높은 가격의
+    매수를 만드는 것이었다. `decide()` 의 대조는 이미 메모리에 있는 상태를
+    보호하고, 이 대조는 손상된 행이 메모리에 들어오는 것을 막는다.
+
+    `ladder` 가 `None` 이면 H4 는 검사할 수 없다 — 대조 기준이 없다. 그때는 H3 만
+    적용한다.
+
+    반환 순서는 항상 `stage_no` 오름차순이다. DB 가 `ORDER BY` 없이 주더라도
+    호출부가 순서에 의존할 수 있어야 한다.
+
+    빈 목록 처리: `ladder` 가 없고 `rows` 도 비면 `expected` 와 `actual` 이 둘 다
+    빈 집합이 되어 통과해버린다. 이 경로를 특별히 막지 않는다 — 사이클이
+    있으면 단계도 있으므로 `ladder` 없이 빈 목록을 넘기는 호출부는 없다.
+    """
+    stages = [row_to_stage(row) for row in rows]
+
+    seen: dict[int, StageState] = {}
+    for stage in stages:
+        if stage.stage_no in seen:
+            raise CorruptRowError(
+                f"duplicate stage_no {stage.stage_no} in cycle {cycle_id}"
+            )
+        seen[stage.stage_no] = stage
+
+    if ladder is not None:
+        expected = set(range(1, ladder.max_stages + 1))
+    else:
+        expected = set(range(1, len(seen) + 1)) if seen else set()
+
+    actual = set(seen)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        raise CorruptRowError(
+            f"incomplete stage set for cycle {cycle_id}: "
+            f"missing {missing}, unexpected {extra}"
+        )
+
+    if ladder is not None:
+        for stage_no in sorted(seen):
+            stage = seen[stage_no]
+            expected_trigger = ladder.trigger_price(stage_no)
+            if stage.trigger_price != expected_trigger:
+                raise CorruptRowError(
+                    f"trigger_price mismatch on stage {stage_no} of cycle "
+                    f"{cycle_id}: row has {stage.trigger_price}, ladder computes "
+                    f"{expected_trigger}"
+                )
+
+    return [seen[n] for n in sorted(seen)]
