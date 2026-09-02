@@ -12,7 +12,7 @@ from decimal import Decimal
 
 import pytest
 
-from autotrading7s.adapters.sqlite.mapping import CorruptRowError
+from autotrading7s.adapters.sqlite.mapping import CorruptRowError, row_to_stage
 from autotrading7s.ports.repository import SplitConfig
 from autotrading7s.adapters.sqlite.migrations import apply_schema, connect
 from autotrading7s.adapters.sqlite.repository import SqliteRepository
@@ -22,7 +22,6 @@ from autotrading7s.domain.cycle import (
     is_cycle_complete,
 )
 from autotrading7s.domain.guards import GuardContext, check_buy, check_sell
-from autotrading7s.domain.ladder import Ladder
 from autotrading7s.domain.pnl import held_qty, invested_amount
 from autotrading7s.domain.rules import BuyStage, SellStage, TriggerParams, decide
 from autotrading7s.domain.stage import (
@@ -113,7 +112,7 @@ def test_the_full_cycle_survives_a_database_round_trip(repo):
                 stock_invested=invested_amount(live_stages),
                 stock_limit=config.total_limit,
                 total_invested=invested_amount(live_stages),
-                total_limit=21_000_000, orders_last_minute=orders % 10)
+                total_limit=21_000_000, orders_last_minute=orders)
             index = decision.stage_no - 1
             if isinstance(decision, BuyStage):
                 assert check_buy(decision, ctx).allowed
@@ -251,7 +250,11 @@ def test_timestamps_stay_aware_so_the_cooldown_still_works(repo):
 
 
 def test_h3_and_h4_hold_at_the_repository_boundary(repo):
-    """도메인은 부분 목록을 허용하고 리포지토리는 완전한 것만 준다."""
+    """도메인은 부분 목록을 허용하고 리포지토리는 완전한 것만 준다.
+
+    H3(완전한 집합)과 H4(trigger_price 대조)를 순서대로 확인한다 — 둘 다 같은
+    "리포지토리 밖의 손상" 시나리오이므로 한 테스트에 둔다.
+    """
     config_id = repo.save_config(a_config())
     ladder = repo.load_config(config_id).to_ladder(anchor_price=10_000)
     cycle = repo.create_cycle(config_id, started_at=T0)
@@ -265,12 +268,51 @@ def test_h3_and_h4_hold_at_the_repository_boundary(repo):
 
     assert len(repo.load_stages(cycle.cycle_id)) == 7
 
+    # H3 — 완전성. 4단계 행을 지워 불완전한 집합을 만든다.
     repo._conn.execute(  # noqa: SLF001 — 리포지토리 밖의 손상을 시뮬레이션
         "DELETE FROM stage_state WHERE cycle_id = ? AND stage_no = 4",
         (cycle.cycle_id,))
     repo._conn.commit()
     with pytest.raises(CorruptRowError, match="incomplete"):
         repo.load_stages(cycle.cycle_id)
+
+    # 4단계를 복원해 집합을 다시 완전하게 만든다 — 이제부터는 H4 만 본다.
+    repo.save_stage(cycle.cycle_id, StageState(
+        stage_no=4, status=StageStatus.WAITING,
+        trigger_price=ladder.trigger_price(4),
+        planned_qty=ladder.planned_qty(4)))
+    assert len(repo.load_stages(cycle.cycle_id)) == 7
+
+    # H4 — trigger_price 대조. 3단계의 저장된 발동가를 사다리 계산과 다르게
+    # 손상시킨다. 개수는 여전히 7개이므로 H3 는 통과하지만, ladder_json 과
+    # 대조하는 H4 가 이 불일치를 거부해야 한다.
+    repo._conn.execute(
+        "UPDATE stage_state SET trigger_price = ? "
+        "WHERE cycle_id = ? AND stage_no = 3",
+        (999_999, cycle.cycle_id))
+    repo._conn.commit()
+    with pytest.raises(CorruptRowError, match="trigger_price mismatch"):
+        repo.load_stages(cycle.cycle_id)
+
+
+def test_h1_type_error_from_a_caller_bug_is_not_wrapped():
+    """H1 의 나머지 절반 — 복원 실패와 호출자 버그를 구분한다.
+
+    위 테스트가 이미 보여준 것은 값 손상이 `CorruptRowError` 로 감싸지는
+    절반이다. `CorruptRowError` 는 `DomainInvariantError`(→ `ValueError`)의
+    하위이므로 `row_to_stage` 는 `ValueError` 만 잡아 감싼다. 여기서는 저장된
+    `trigger_price` 자리에 `int` 가 아닌 값(호출자가 잘못 만든 dict, 즉 DB
+    손상이 아니라 프로그래밍 오류)을 넣어, `TypeError` 가 그대로(감싸지지
+    않고) 올라오는지 확인한다 — 개발 중에 드러나야 하는 종류의 실패다.
+    """
+    bad_row = {
+        "id": 1, "cycle_id": 1, "stage_no": 1, "status": "WAITING",
+        "trigger_price": "9500",  # str — 호출자 버그, DB 손상이 아니다
+        "planned_qty": 100, "fill_price": None, "fill_qty": None,
+        "bought_at": None, "last_sold_at": None, "rebuy_count": 0,
+    }
+    with pytest.raises(TypeError):
+        row_to_stage(bad_row)
 
 
 def test_ports_and_adapters_import_only_inward():
@@ -292,12 +334,22 @@ def test_ports_and_adapters_import_only_inward():
             for node in ast.walk(tree):
                 if isinstance(node, ast.ImportFrom):
                     module = node.module or ""
+                    level = node.level
                 elif isinstance(node, ast.Import):
                     module = node.names[0].name
+                    level = 0
                 else:
                     continue
                 for banned in forbidden:
-                    if f"autotrading7s.{banned}" in module:
-                        offenders.append(f"{path.name}: {module}")
+                    # 절대 임포트는 "autotrading7s.<banned>" 부분 문자열로
+                    # 잡힌다. 상대 임포트(level > 0, 예: `from ..adapters.sqlite
+                    # import mapping`)는 module 에 "autotrading7s" 접두어가
+                    # 붙지 않으므로(이 경우 module 은 "adapters.sqlite") 위
+                    # 부분 문자열 검사를 그냥 피해간다 — 그래서 level > 0 이면
+                    # 접두어 없이 루트 세그먼트로 다시 대조한다.
+                    absolute_hit = f"autotrading7s.{banned}" in module
+                    relative_hit = level > 0 and module.split(".")[0] == banned
+                    if absolute_hit or relative_hit:
+                        offenders.append(f"{path.name}: {module} (level={level})")
 
     assert offenders == [], f"의존 방향 위반: {offenders}"
