@@ -52,6 +52,7 @@ Plan 2B로 넘기는 handover 네 건은 이 계획의 범위 밖이다: 긴급�
 | `src/autotrading7s/adapters/sqlite/migrations.py` | 스키마 적용과 버전 추적 |
 | `src/autotrading7s/adapters/sqlite/codec.py` | `Decimal`·`datetime`의 TEXT 왕복 (H2) |
 | `src/autotrading7s/adapters/sqlite/mapping.py` | 행 ↔ 도메인 객체 변환, `CorruptRowError` (H1·H3·H4) |
+| `src/autotrading7s/ports/repository.py` | `RepositoryPort` + 계약 DTO `SplitConfig`·`HoldingRow` |
 | `src/autotrading7s/adapters/sqlite/repository.py` | `SqliteRepository(RepositoryPort)` |
 | `src/autotrading7s/adapters/fake/broker.py` | `FakeBroker(BrokerPort)` — 시세 재생, 체결·실패 모드 |
 | `tests/adapters/sqlite/*` | 위 각 모듈의 테스트 |
@@ -465,24 +466,47 @@ git commit -m "$(printf 'feat: 브로커 포트 선언\n\n설계서 8.1절. 도�
 - Test: `tests/ports/test_repository.py`
 
 **Interfaces:**
-- Consumes: `SplitConfig`(Task 6에서 정의), `Cycle`, `StageState`, `CloseReason`
-- Produces: `RepositoryPort` Protocol, `@runtime_checkable`
+- Consumes: `Cycle`, `StageState`, `CloseReason`, `CycleStatus`, `Ladder` (모두 `domain/`)
+- Produces: `RepositoryPort` Protocol(`@runtime_checkable`), `SplitConfig`, `HoldingRow`
 
-**주의 — 이 태스크는 `SplitConfig` 를 아직 정의하지 않는다.** 포트는 타입 이름만
-참조하고 Task 6이 그 타입을 만든다. 그래서 이 태스크의 테스트는 메서드 목록과
-`runtime_checkable` 성질만 검사하고, 실제 저장·복원 동작은 Task 8이 검사한다.
+**DTO 두 개가 포트와 함께 산다.** `SplitConfig` 와 `HoldingRow` 는 도메인 타입이
+아니다 — 설정은 사용자 입력의 저장 형태이고, `HoldingRow` 는 UI 를 위한 읽기 모델이다.
+그렇다고 SQLite 어댑터의 것도 아니다: **이 포트의 계약이 그 두 타입으로 쓰여 있다.**
+어댑터 층에 두면 포트를 소비하는 모든 코드(Plan 2B 의 `engine/` 포함)가 DTO 하나를
+얻으려고 `adapters/sqlite/` 를 import 해야 하고, 그것은 화살표를 거꾸로 돌리는 것이다.
+
+그래서 여기서 정의하고, `adapters/sqlite/mapping.py` 가 **가져다 쓴다**.
 
 포트를 먼저 선언하는 이유는 Task 8~10이 메서드를 하나씩 채워 나가는 동안 "무엇을
-채워야 하는가" 의 목록이 고정되어 있어야 하기 때문이다.
+채워야 하는가" 의 목록이 고정되어 있어야 하기 때문이다. 실제 저장·복원 **동작**은
+Task 8~10이 검사한다 — 이 태스크는 계약의 모양만 고정한다.
 
 - [ ] **Step 1: 실패하는 테스트 작성 — `tests/ports/test_repository.py`**
 
 ```python
 from __future__ import annotations
 
+import dataclasses
 import inspect
+from datetime import datetime, timezone
+from decimal import Decimal
 
-from autotrading7s.ports.repository import RepositoryPort
+import pytest
+
+from autotrading7s.domain.ladder import Ladder
+from autotrading7s.ports.repository import HoldingRow, RepositoryPort, SplitConfig
+
+T0 = datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc)
+FIVE = Decimal("0.05")
+
+
+def a_config(**over) -> SplitConfig:
+    kw = dict(config_id=None, stock_code="005930", stock_name="삼성전자",
+              label="기본", max_stages=7, drop_pct=FIVE, target_pct=FIVE,
+              amount_per_stage=1_000_000, allow_rebuy=True,
+              rebuy_cooldown_sec=60, total_limit=7_000_000, status="ACTIVE",
+              created_at=T0, updated_at=T0)
+    return SplitConfig(**{**kw, **over})
 
 
 def test_repository_port_declares_the_expected_methods():
@@ -510,7 +534,48 @@ def test_repository_port_declares_the_expected_methods():
 
 def test_repository_port_is_runtime_checkable():
     assert getattr(RepositoryPort, "_is_runtime_protocol", False) is True
+
+
+def test_split_config_to_ladder_carries_every_field_through():
+    """설정의 어느 필드가 사다리로 흘러가는지 고정한다 — 이름을 잘못 짝지으면
+    앵커 확정 시점에 조용히 다른 사다리가 만들어진다."""
+    lad = a_config().to_ladder(anchor_price=10_000)
+    assert lad == Ladder(anchor_price=10_000, drop_pct=FIVE, target_pct=FIVE,
+                         max_stages=7, amount_per_stage=1_000_000)
+    # 1단계는 앵커 그대로, 2단계는 5% 아래(호가 단위로 내림)
+    assert lad.trigger_price(1) == 10_000
+    assert lad.trigger_price(2) == 9_500
+
+
+def test_split_config_to_ladder_rejects_an_invalid_anchor():
+    """`Ladder` 의 검증이 이 경계에서도 살아 있어야 한다 — 설정이 유효해도
+    앵커가 유효하지 않으면 사다리는 만들어지지 않는다."""
+    from autotrading7s.domain.ladder import LadderConfigError
+
+    with pytest.raises(LadderConfigError):
+        a_config().to_ladder(anchor_price=0)
+
+
+def test_the_contract_dtos_are_frozen():
+    """엔진과 UI 가 같은 객체를 들고 있으므로 변경 불가여야 한다."""
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        a_config().stock_code = "000660"  # type: ignore[misc]
+
+    row = HoldingRow(stock_code="005930", stock_name="삼성전자", label="기본",
+                     cycle_id=1, total_qty=316, avg_price=9_458,
+                     holding_stages=3, max_stages=7,
+                     cycle_status=CycleStatus.RUNNING)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        row.total_qty = 0  # type: ignore[misc]
 ```
+
+`CycleStatus` import 를 위 블록의 import 목록에 더한다
+(`from autotrading7s.domain.types import CycleStatus`).
+
+**`to_ladder` 를 여기서 검사하는 이유.** 그 메서드가 이 태스크의 유일한 **동작**이다
+— 나머지는 선언뿐이다. Plan 1 에서 가장 비싼 결함들이 "필드 이름을 잘못 짝지어
+조용히 다른 값이 흘러간 것"이었으므로(`to_holding` 이 9,000×111 을 1×1 로 덮어쓴
+사례), 필드가 사다리로 옮겨가는 지점을 값으로 못 박는다.
 
 - [ ] **Step 2: 테스트 실패 확인**
 
@@ -533,10 +598,69 @@ tz-aware datetime)을 강제하는 지점이다.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Protocol, runtime_checkable
 
-if TYPE_CHECKING:  # 순환 import 회피 — 런타임에는 필요 없다
-    from autotrading7s.adapters.sqlite.mapping import HoldingRow, SplitConfig
+from autotrading7s.domain.cycle import Cycle
+from autotrading7s.domain.ladder import Ladder
+from autotrading7s.domain.stage import StageState
+from autotrading7s.domain.types import CloseReason, CycleStatus
+
+
+@dataclass(frozen=True, slots=True)
+class SplitConfig:
+    """분할 설정 — 설계서 12.1절 `split_config`.
+
+    도메인에는 이 타입이 없다. 설정은 사용자 입력의 저장 형태이고, 도메인이 쓰는
+    것은 그것으로 만든 `Ladder` 와 `TriggerParams` 다. 그렇다고 어댑터의 것도
+    아니다 — **이 포트의 계약이 이 타입으로 쓰여 있으므로 포트와 함께 산다.**
+    SQLite 어댑터든 다른 어떤 구현이든 이것을 가져다 쓴다.
+    """
+
+    config_id: int | None
+    stock_code: str
+    stock_name: str | None
+    label: str | None
+    max_stages: int
+    drop_pct: Decimal
+    target_pct: Decimal
+    amount_per_stage: int
+    allow_rebuy: bool
+    rebuy_cooldown_sec: int
+    total_limit: int
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+    def to_ladder(self, anchor_price: int) -> Ladder:
+        """앵커가 확정된 뒤 이 설정으로 사다리를 만든다."""
+        return Ladder(
+            anchor_price=anchor_price,
+            drop_pct=self.drop_pct,
+            target_pct=self.target_pct,
+            max_stages=self.max_stages,
+            amount_per_stage=self.amount_per_stage,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class HoldingRow:
+    """설계서 12.3절 `holdings` 뷰의 한 행.
+
+    현재가와 평가손익률은 실시간 값이므로 뷰에 없다 — UI 가 최신 틱과 결합해
+    `domain/pnl.py` 의 순수 함수로 계산한다.
+    """
+
+    stock_code: str
+    stock_name: str | None
+    label: str | None
+    cycle_id: int
+    total_qty: int
+    avg_price: int
+    holding_stages: int
+    max_stages: int
+    cycle_status: CycleStatus
     from autotrading7s.domain.cycle import Cycle
     from autotrading7s.domain.stage import StageState
     from autotrading7s.domain.types import CloseReason, OrderPath, Side
@@ -634,14 +758,14 @@ Run:
 .venv/bin/python -m pytest tests/ports/test_repository.py -v
 .venv/bin/python -m pytest tests/ -q
 ```
-Expected: PASS. `TYPE_CHECKING` 블록 안의 import 는 런타임에 실행되지 않으므로
+Expected: PASS. `ports/` 는 `domain/` 만 import 하므로
 `mapping.py` 가 아직 없어도 import 오류가 나지 않는다.
 
 - [ ] **Step 5: 커밋**
 
 ```bash
 git add src/autotrading7s/ports/repository.py tests/ports/test_repository.py
-git commit -m "$(printf 'feat: 리포지토리 포트 선언\n\n설계서 12절 스키마의 접근면. 메서드가 행이나 dict 가 아니라 도메인 객체를\n주고받으며, 변환은 어댑터의 매핑 계층이 한다 — 그곳이 Plan 1 이 넘긴 제약\n(완전한 단계 집합, trigger_price 대조, tz-aware datetime)을 강제하는 지점이다.\n\n메서드 목록을 집합으로 단정해 Task 8~10 의 진행 상황을 셀 수 있게 했다.\nSplitConfig·HoldingRow 는 Task 6 이 정의하므로 TYPE_CHECKING 으로 참조한다.')"
+git commit -m "$(printf 'feat: 리포지토리 포트 선언\n\n설계서 12절 스키마의 접근면. 메서드가 행이나 dict 가 아니라 도메인 객체를\n주고받으며, 변환은 어댑터의 매핑 계층이 한다 — 그곳이 Plan 1 이 넘긴 제약\n(완전한 단계 집합, trigger_price 대조, tz-aware datetime)을 강제하는 지점이다.\n\n메서드 목록을 집합으로 단정해 Task 8~10 의 진행 상황을 셀 수 있게 했다.\nSplitConfig 와 HoldingRow 도 여기 둔다. 포트의 계약이 그 두 타입으로 쓰여 있으므로\n포트와 함께 사는 것이 맞다 — 어댑터 층에 두면 포트를 쓰는 모든 코드가 DTO 하나를\n얻으려고 adapters/sqlite/ 를 import 해야 하고 화살표가 거꾸로 돈다.')"
 ```
 
 ---
@@ -1281,10 +1405,8 @@ git commit -m "$(printf 'feat: Decimal·datetime 의 TEXT 왕복 코덱\n\nSQLit
 - Test: `tests/adapters/sqlite/test_mapping_config_cycle.py`
 
 **Interfaces:**
-- Consumes: `codec` (Task 5), `Ladder`·`LadderConfigError` (`domain/ladder.py`), `Cycle`·`CycleStatus`·`CloseReason` (`domain/cycle.py`, `domain/types.py`), `DomainInvariantError` (Task 1)
+- Consumes: `codec` (Task 5), `SplitConfig` (Task 3 — `ports/repository.py`), `Ladder`·`LadderConfigError` (`domain/ladder.py`), `Cycle`·`CycleStatus`·`CloseReason` (`domain/cycle.py`, `domain/types.py`), `DomainInvariantError` (Task 1)
 - Produces:
-  - `SplitConfig` — frozen dataclass: `config_id: int | None`, `stock_code: str`, `stock_name: str | None`, `label: str | None`, `max_stages: int`, `drop_pct: Decimal`, `target_pct: Decimal`, `amount_per_stage: int`, `allow_rebuy: bool`, `rebuy_cooldown_sec: int`, `total_limit: int`, `status: str`, `created_at: datetime`, `updated_at: datetime`
-  - `HoldingRow` — frozen dataclass: `stock_code: str`, `stock_name: str | None`, `label: str | None`, `cycle_id: int`, `total_qty: int`, `avg_price: int`, `holding_stages: int`, `max_stages: int`, `cycle_status: CycleStatus`
   - `CorruptRowError(DomainInvariantError)` — 어느 테이블의 어느 행인지 지목한다
   - `config_to_row(config) -> dict`, `row_to_config(row) -> SplitConfig`
   - `ladder_to_json(ladder) -> str`, `json_to_ladder(text) -> Ladder`
@@ -1313,7 +1435,6 @@ import pytest
 
 from autotrading7s.adapters.sqlite.mapping import (
     CorruptRowError,
-    SplitConfig,
     config_to_row,
     cycle_to_row,
     json_to_ladder,
@@ -1321,6 +1442,7 @@ from autotrading7s.adapters.sqlite.mapping import (
     row_to_config,
     row_to_cycle,
 )
+from autotrading7s.ports.repository import SplitConfig
 from autotrading7s.domain.cycle import Cycle
 from autotrading7s.domain.errors import DomainInvariantError
 from autotrading7s.domain.ladder import Ladder
@@ -1476,7 +1598,7 @@ def test_row_to_cycle_wraps_an_unknown_status():
 Run: `.venv/bin/python -m pytest tests/adapters/sqlite/test_mapping_config_cycle.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'autotrading7s.adapters.sqlite.mapping'`
 
-- [ ] **Step 3: `mapping.py` 의 `SplitConfig`·`HoldingRow`·`CorruptRowError` 작성**
+- [ ] **Step 3: `mapping.py` 의 `CorruptRowError` 와 설정 변환 작성**
 
 ```python
 """행 ↔ 도메인 객체 변환.
@@ -1511,6 +1633,7 @@ from autotrading7s.domain.cycle import Cycle
 from autotrading7s.domain.errors import DomainInvariantError
 from autotrading7s.domain.ladder import Ladder
 from autotrading7s.domain.types import CloseReason, CycleStatus
+from autotrading7s.ports.repository import SplitConfig
 
 
 class CorruptRowError(DomainInvariantError):
@@ -1520,58 +1643,6 @@ class CorruptRowError(DomainInvariantError):
 def _corrupt(table: str, rowid: object, cause: Exception) -> CorruptRowError:
     return CorruptRowError(f"corrupt row in {table} (id={rowid}): {cause}")
 
-
-@dataclass(frozen=True, slots=True)
-class SplitConfig:
-    """분할 설정 — 설계서 12.1절 `split_config`.
-
-    도메인에는 이 타입이 없다. 설정은 사용자 입력의 저장 형태이고, 도메인이 쓰는
-    것은 그것으로 만든 `Ladder` 와 `TriggerParams` 다. 그래서 어댑터 층에 둔다.
-    """
-
-    config_id: int | None
-    stock_code: str
-    stock_name: str | None
-    label: str | None
-    max_stages: int
-    drop_pct: Decimal
-    target_pct: Decimal
-    amount_per_stage: int
-    allow_rebuy: bool
-    rebuy_cooldown_sec: int
-    total_limit: int
-    status: str
-    created_at: datetime
-    updated_at: datetime
-
-    def to_ladder(self, anchor_price: int) -> Ladder:
-        """앵커가 확정된 뒤 이 설정으로 사다리를 만든다."""
-        return Ladder(
-            anchor_price=anchor_price,
-            drop_pct=self.drop_pct,
-            target_pct=self.target_pct,
-            max_stages=self.max_stages,
-            amount_per_stage=self.amount_per_stage,
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class HoldingRow:
-    """설계서 12.3절 `holdings` 뷰의 한 행.
-
-    현재가와 평가손익률은 실시간 값이므로 뷰에 없다 — UI 가 최신 틱과 결합해
-    `domain/pnl.py` 의 순수 함수로 계산한다.
-    """
-
-    stock_code: str
-    stock_name: str | None
-    label: str | None
-    cycle_id: int
-    total_qty: int
-    avg_price: int
-    holding_stages: int
-    max_stages: int
-    cycle_status: CycleStatus
 ```
 
 - [ ] **Step 4: `config_to_row` / `row_to_config` 작성**
@@ -2139,7 +2210,8 @@ from decimal import Decimal
 
 import pytest
 
-from autotrading7s.adapters.sqlite.mapping import CorruptRowError, SplitConfig
+from autotrading7s.adapters.sqlite.mapping import CorruptRowError
+from autotrading7s.ports.repository import SplitConfig
 from autotrading7s.adapters.sqlite.migrations import apply_schema, connect
 from autotrading7s.adapters.sqlite.repository import SqliteRepository
 from autotrading7s.domain.cycle import Cycle, confirm_anchor, start
@@ -2344,7 +2416,6 @@ from datetime import datetime
 
 from autotrading7s.adapters.sqlite.codec import dt_to_text
 from autotrading7s.adapters.sqlite.mapping import (
-    SplitConfig,
     config_to_row,
     cycle_to_row,
     row_to_config,
@@ -2352,6 +2423,7 @@ from autotrading7s.adapters.sqlite.mapping import (
     rows_to_stages,
     stage_to_row,
 )
+from autotrading7s.ports.repository import SplitConfig
 from autotrading7s.domain.cycle import Cycle
 from autotrading7s.domain.stage import StageState
 from autotrading7s.domain.types import CycleStatus
@@ -2527,7 +2599,7 @@ from uuid import uuid4
 
 import pytest
 
-from autotrading7s.adapters.sqlite.mapping import SplitConfig
+from autotrading7s.ports.repository import SplitConfig
 from autotrading7s.adapters.sqlite.migrations import apply_schema, connect
 from autotrading7s.adapters.sqlite.repository import SqliteRepository
 from autotrading7s.domain.cycle import confirm_anchor
@@ -2838,7 +2910,7 @@ from decimal import Decimal
 
 import pytest
 
-from autotrading7s.adapters.sqlite.mapping import SplitConfig
+from autotrading7s.ports.repository import SplitConfig
 from autotrading7s.adapters.sqlite.migrations import apply_schema, connect
 from autotrading7s.adapters.sqlite.repository import SqliteRepository
 from autotrading7s.domain.cycle import confirm_anchor
@@ -3929,7 +4001,8 @@ from decimal import Decimal
 
 import pytest
 
-from autotrading7s.adapters.sqlite.mapping import CorruptRowError, SplitConfig
+from autotrading7s.adapters.sqlite.mapping import CorruptRowError
+from autotrading7s.ports.repository import SplitConfig
 from autotrading7s.adapters.sqlite.migrations import apply_schema, connect
 from autotrading7s.adapters.sqlite.repository import SqliteRepository
 from autotrading7s.domain.cycle import (
@@ -4215,22 +4288,21 @@ def test_ports_and_adapters_import_only_inward():
 ```
 
 `tests/test_g1_gate.py` 의 AST 테스트는 `domain/` 만 본다. 이 테스트는 `ports/` 가
-`adapters/` 를 참조하지 않는지 추가로 검사한다 — Task 3 의 `TYPE_CHECKING` 블록이
-`mapping` 을 참조하므로, 그것이 런타임 import 가 되면 여기서 잡힌다.
+`adapters/` 를 참조하지 않는지 추가로 검사한다.
 
-`TYPE_CHECKING` 안의 import 도 `ast` 는 `ImportFrom` 으로 본다. 그래서 이 테스트가
-Task 3 의 코드에서 실패할 것이다. 두 가지 중 하나를 택한다: (a) 테스트가
-`TYPE_CHECKING` 블록을 건너뛰게 만든다, (b) `ports/repository.py` 가 타입을
-문자열로만 참조하고 import 를 아예 없앤다. **(a) 를 택한다** — `TYPE_CHECKING` import
-는 런타임 의존이 아니므로 의존 방향 위반이 아니고, 그것을 테스트가 이해해야 한다.
-`ast.If` 노드의 test 가 `TYPE_CHECKING` 인 블록을 순회에서 제외하는 방식으로
-구현하고, 그 이유를 주석에 적는다.
+**`TYPE_CHECKING` 예외 처리는 두지 않는다.** `ports/repository.py` 가 계약 DTO 를
+직접 정의하므로(Task 3) `ports/` 는 `adapters/` 를 어떤 형태로도 참조하지 않는다 —
+`TYPE_CHECKING` 안이든 밖이든. 테스트를 느슨하게 만들 이유가 없으므로 모든
+`Import`·`ImportFrom` 노드를 그대로 검사한다. 만약 나중에 누군가 `ports/` 에서
+`adapters/` 를 `TYPE_CHECKING` 으로 참조하고 싶어진다면, 그것은 타입이 잘못된 층에
+있다는 신호이므로 이 테스트가 실패하는 것이 옳다.
 
 - [ ] **Step 2: 테스트 실행 — 실패를 관찰하고 AST 예외 처리를 구현**
 
 Run: `.venv/bin/python -m pytest tests/test_g2a_gate.py -v`
-Expected: 처음에는 `test_ports_and_adapters_import_only_inward` 가 Task 3 의
-`TYPE_CHECKING` import 때문에 실패한다. 위 (a) 방식으로 고친 뒤 통과해야 한다.
+Expected: PASS — `test_ports_and_adapters_import_only_inward` 를 포함해 전부.
+만약 이 테스트가 실패한다면 `ports/` 나 `domain/` 어딘가가 바깥 층을 참조하고 있는
+것이므로, 테스트를 고치지 말고 그 import 를 고쳐라.
 
 - [ ] **Step 3: G2a 게이트 실행 — 전체 스위트와 커버리지**
 
@@ -4274,7 +4346,7 @@ Expected:
 
 ```bash
 git add tests/test_g2a_gate.py README.md
-git commit -m "$(printf 'test: G2a 게이트 — 영속성 계약의 조합 검증\n\nG1 이 도메인 계약의 조합을 검증했듯, 이 게이트는 영속성 계약의 조합을 검증한다.\n핵심 테스트는 G1 의 전 사이클 시나리오를 매 결정마다 저장하고 다시 읽어서 돌리는\n것이다 — 도메인만으로 돌린 결과와 DB 를 경유한 결과가 같아야 한다(보유 433주,\n매도 순서 [4,3,2,1], 총 주문 7건).\n\nH1~H5 를 각각 게이트에서 확인한다. 특히 H2 는 쿨다운 산술이 복원된 시각으로\n성립하는지 직접 검사한다 — naive 로 돌아오면 엔진 틱 루프 안에서 TypeError 가\n난다는 것이 Plan 1 Task 9 가 확인한 실패 모드다.\n\n의존 방향 테스트를 ports·adapters 까지 확장했다. TYPE_CHECKING 블록의 import 는\n런타임 의존이 아니므로 순회에서 제외한다.')"
+git commit -m "$(printf 'test: G2a 게이트 — 영속성 계약의 조합 검증\n\nG1 이 도메인 계약의 조합을 검증했듯, 이 게이트는 영속성 계약의 조합을 검증한다.\n핵심 테스트는 G1 의 전 사이클 시나리오를 매 결정마다 저장하고 다시 읽어서 돌리는\n것이다 — 도메인만으로 돌린 결과와 DB 를 경유한 결과가 같아야 한다(보유 433주,\n매도 순서 [4,3,2,1], 총 주문 7건).\n\nH1~H5 를 각각 게이트에서 확인한다. 특히 H2 는 쿨다운 산술이 복원된 시각으로\n성립하는지 직접 검사한다 — naive 로 돌아오면 엔진 틱 루프 안에서 TypeError 가\n난다는 것이 Plan 1 Task 9 가 확인한 실패 모드다.\n\n의존 방향 테스트를 ports 까지 확장했다. 계약 DTO 가 포트에 있으므로 ports 는\nadapters 를 어떤 형태로도 참조하지 않으며, 예외 처리 없이 모든 import 를 검사한다.')"
 ```
 
 ---
