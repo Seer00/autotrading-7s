@@ -1322,15 +1322,26 @@ def ratio_to_text(value: Decimal) -> str:
     """비율을 TEXT 로. 지수 표기를 쓰지 않는다."""
     if not isinstance(value, Decimal):
         raise TypeError(f"ratio must be Decimal, not {type(value).__name__}")
+    if not value.is_finite():
+        raise DomainInvariantError(
+            f"ratio must be finite, not {value!r} (NaN or Infinity)"
+        )
     # format(value, "f") 는 지수 표기를 쓰지 않고 유효자리를 보존한다.
     return format(value, "f")
 
 
 def text_to_ratio(text: str) -> Decimal:
+    if not isinstance(text, str):
+        raise TypeError(f"ratio text must be str, not {type(text).__name__}")
     try:
-        return Decimal(text)
+        value = Decimal(text)
     except InvalidOperation as exc:
         raise DomainInvariantError(f"not a valid ratio: {text!r}") from exc
+    if not value.is_finite():
+        raise DomainInvariantError(
+            f"ratio must be finite, not {value!r} (NaN or Infinity)"
+        )
+    return value
 
 
 def _require_aware(value: datetime, label: str) -> None:
@@ -1352,7 +1363,7 @@ def text_to_dt(text: str) -> datetime:
     """ISO 8601 TEXT 를 시각으로. 오프셋이 없으면 거부한다(H2)."""
     try:
         value = datetime.fromisoformat(text)
-    except (ValueError, TypeError) as exc:
+    except ValueError as exc:
         raise DomainInvariantError(f"not a valid timestamp: {text!r}") from exc
     _require_aware(value, f"timestamp {text!r}")
     return value
@@ -1376,6 +1387,22 @@ def int_to_bool(value: int) -> bool:
         raise DomainInvariantError(f"boolean column must be 0 or 1, got {value}")
     return value == 1
 ```
+
+**실행 중 수정됨 (커밋 07871d1).** 위 블록의 초안에는 세 가지 결함이 있었고 리뷰가
+전부 잡았다. 기록해 둔다 — 같은 부류가 뒤 태스크에서도 나올 수 있다:
+
+1. `text_to_ratio` 에 타입 가드가 없어 `text_to_ratio(0.05)` 가 58자의 이진
+   부동소수 잡음을 조용히 통과시켰다. **쓰는 쪽 `ratio_to_text` 는 막고 읽는 쪽만
+   안 막는 비대칭**이었다.
+2. `text_to_dt` 가 `except (ValueError, TypeError)` 로 묶어 호출자의 타입 버그를
+   `DomainInvariantError` 로 바꿨다. Task 6 이 그것을 `CorruptRowError` 로 감싸므로
+   매핑의 널 검사 누락이 "corrupt row in cycle (id=3)" 로 위장한다. nullable 시각
+   컬럼의 `None if x is None else text_to_dt(x)` 가드가 그래서 하중을 받는다.
+3. 유한하지 않은 `Decimal` 이 그대로 통과했다. `Infinity` 는 하류의
+   `LadderConfigError` 가 잡지만 **`NaN` 은 `decimal.InvalidOperation` 을 내며 그것은
+   `ValueError` 의 하위가 아니다**(MRO: `InvalidOperation` → `DecimalException` →
+   `ArithmeticError`). 그래서 Task 6 의 `except ValueError` 를 통과해 어느 행인지
+   모르는 맨 예외로 표면화된다.
 
 - [ ] **Step 4: 테스트 통과와 회귀 확인**
 
