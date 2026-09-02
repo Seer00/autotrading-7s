@@ -597,15 +597,15 @@ tz-aware datetime)을 강제하는 지점이다.
 
 from __future__ import annotations
 
-from datetime import datetime
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Protocol, runtime_checkable
 
 from autotrading7s.domain.cycle import Cycle
 from autotrading7s.domain.ladder import Ladder
 from autotrading7s.domain.stage import StageState
-from autotrading7s.domain.types import CloseReason, CycleStatus
+from autotrading7s.domain.types import CycleStatus, OrderPath, Side
 
 
 @dataclass(frozen=True, slots=True)
@@ -661,9 +661,6 @@ class HoldingRow:
     holding_stages: int
     max_stages: int
     cycle_status: CycleStatus
-    from autotrading7s.domain.cycle import Cycle
-    from autotrading7s.domain.stage import StageState
-    from autotrading7s.domain.types import CloseReason, OrderPath, Side
 
 
 @runtime_checkable
