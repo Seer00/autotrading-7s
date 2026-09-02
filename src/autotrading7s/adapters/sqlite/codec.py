@@ -22,15 +22,26 @@ def ratio_to_text(value: Decimal) -> str:
     """비율을 TEXT 로. 지수 표기를 쓰지 않는다."""
     if not isinstance(value, Decimal):
         raise TypeError(f"ratio must be Decimal, not {type(value).__name__}")
+    if not value.is_finite():
+        raise DomainInvariantError(
+            f"ratio must be finite, not {value!r} (NaN or Infinity)"
+        )
     # format(value, "f") 는 지수 표기를 쓰지 않고 유효자리를 보존한다.
     return format(value, "f")
 
 
 def text_to_ratio(text: str) -> Decimal:
+    if not isinstance(text, str):
+        raise TypeError(f"ratio text must be str, not {type(text).__name__}")
     try:
-        return Decimal(text)
+        value = Decimal(text)
     except InvalidOperation as exc:
         raise DomainInvariantError(f"not a valid ratio: {text!r}") from exc
+    if not value.is_finite():
+        raise DomainInvariantError(
+            f"ratio must be finite, not {value!r} (NaN or Infinity)"
+        )
+    return value
 
 
 def _require_aware(value: datetime, label: str) -> None:
@@ -52,7 +63,7 @@ def text_to_dt(text: str) -> datetime:
     """ISO 8601 TEXT 를 시각으로. 오프셋이 없으면 거부한다(H2)."""
     try:
         value = datetime.fromisoformat(text)
-    except (ValueError, TypeError) as exc:
+    except ValueError as exc:
         raise DomainInvariantError(f"not a valid timestamp: {text!r}") from exc
     _require_aware(value, f"timestamp {text!r}")
     return value

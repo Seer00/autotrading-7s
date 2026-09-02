@@ -100,3 +100,78 @@ def test_bool_to_int_rejects_non_bool():
 def test_int_to_bool_rejects_values_outside_zero_and_one(value: int):
     with pytest.raises(DomainInvariantError):
         int_to_bool(value)
+
+
+# Fix Round 1: Finding 1 — text_to_ratio must guard against non-string input.
+def test_text_to_ratio_rejects_non_string():
+    """Symmetric to ratio_to_text rejecting non-Decimal. Prevents float noise entry."""
+    with pytest.raises(TypeError):
+        text_to_ratio(0.05)  # type: ignore[arg-type]
+
+
+# Fix Round 1: Finding 3 — Non-finite values must be rejected in both directions.
+def test_ratio_to_text_rejects_nan():
+    """NaN ratios would cause silent failures in domain calculations."""
+    with pytest.raises(DomainInvariantError, match="finite"):
+        ratio_to_text(Decimal("NaN"))
+
+
+def test_ratio_to_text_rejects_infinity():
+    """Infinity ratios would cause silent failures in domain calculations."""
+    with pytest.raises(DomainInvariantError, match="finite"):
+        ratio_to_text(Decimal("Infinity"))
+
+
+def test_text_to_ratio_rejects_nan():
+    """Prevents NaN from entering domain via database."""
+    with pytest.raises(DomainInvariantError, match="finite"):
+        text_to_ratio("NaN")
+
+
+def test_text_to_ratio_rejects_infinity():
+    """Prevents Infinity from entering domain via database."""
+    with pytest.raises(DomainInvariantError, match="finite"):
+        text_to_ratio("Infinity")
+
+
+# Fix Round 1: Finding 2 — text_to_dt must not conflate TypeError with ValueError.
+def test_text_to_dt_rejects_none_with_type_error():
+    """NULL from database should raise TypeError, not be wrapped as row corruption.
+
+    This is the realistic case: a nullable TEXT column read from SQLite yields None.
+    A mapping function that forgot a NULL check is a caller bug, not row corruption.
+    """
+    with pytest.raises(TypeError):
+        text_to_dt(None)  # type: ignore[arg-type]
+
+
+def test_text_to_dt_rejects_int_with_type_error():
+    """Non-string type should raise TypeError, not DomainInvariantError."""
+    with pytest.raises(TypeError):
+        text_to_dt(123)  # type: ignore[arg-type]
+
+
+# Fix Round 1: Bonus Minor — Pin literal TEXT forms, not just round-trip.
+def test_ratio_to_text_literal_form():
+    """Round-trip test passes under several wrong serializations.
+    Pinning the string ensures the storage format is correct."""
+    assert ratio_to_text(Decimal("0.05")) == "0.05"
+    assert ratio_to_text(Decimal("0.1666")) == "0.1666"
+    assert ratio_to_text(Decimal("0.0001")) == "0.0001"
+
+
+def test_dt_to_text_literal_form():
+    """Pinning the ISO 8601 format ensures storage consistency."""
+    value = datetime(2026, 9, 1, 9, 30, tzinfo=timezone.utc)
+    text = dt_to_text(value)
+    assert text == "2026-09-01T09:30:00+00:00"
+
+    value_with_microseconds = datetime(
+        2026, 9, 1, 9, 30, 15, 123456, tzinfo=timezone.utc
+    )
+    text_with_microseconds = dt_to_text(value_with_microseconds)
+    assert text_with_microseconds == "2026-09-01T09:30:15.123456+00:00"
+
+    value_kst = datetime(2026, 9, 1, 18, 30, tzinfo=KST)
+    text_kst = dt_to_text(value_kst)
+    assert text_kst == "2026-09-01T18:30:00+09:00"
