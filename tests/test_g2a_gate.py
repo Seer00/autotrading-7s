@@ -315,13 +315,56 @@ def test_h1_type_error_from_a_caller_bug_is_not_wrapped():
         row_to_stage(bad_row)
 
 
+def _find_forbidden_imports(source: str, forbidden: tuple[str, ...]) -> list[str]:
+    """`source` 를 파싱해 `forbidden` 패키지를 임포트하는 문장을 모두 찾는다.
+
+    세 가지 형태를 잡는다:
+
+    1. 절대 임포트 — `import autotrading7s.adapters.x` 또는
+       `from autotrading7s.adapters import x`. `module` 이나 (`ast.Import`
+       의) 각 이름에 "autotrading7s.<banned>" 부분 문자열이 있으면 잡는다.
+       `ast.Import` 는 `import os, autotrading7s.adapters.x` 처럼 쉼표로
+       여러 모듈을 한 문장에 실을 수 있으므로(Fix Round 3 이전에는
+       `node.names[0]` 만 봐서 이 형태를 놓쳤다) `node.names` 전부를 본다.
+    2. 상대 임포트, 모듈 세그먼트로 패키지를 지목 — `from ..adapters.sqlite
+       import mapping`. `module` 이 "adapters.sqlite" 다(접두어 없음) —
+       `level > 0` 이면 첫 세그먼트로 다시 대조한다.
+    3. 상대 임포트, 형제 패키지 자체를 이름으로 임포트 — `from .. import
+       adapters`. `module` 은 없고(`node.module is None`) 금지된 이름이
+       `node.names` 안에 있다(Fix Round 3 이전에는 이 형태가 `module` 도
+       `module.split(".")[0]` 도 아니어서 아예 검사를 피해갔다).
+    """
+    import ast
+
+    offenders: list[str] = []
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            level = node.level
+        elif isinstance(node, ast.Import):
+            module = ""
+            level = 0
+        else:
+            continue
+        names = [alias.name for alias in node.names]
+        for banned in forbidden:
+            absolute_hit = f"autotrading7s.{banned}" in module or any(
+                f"autotrading7s.{banned}" in name for name in names
+            )
+            relative_module_hit = level > 0 and module.split(".")[0] == banned
+            relative_name_hit = level > 0 and not module and banned in names
+            if absolute_hit or relative_module_hit or relative_name_hit:
+                offenders.append(f"{module or names} (level={level})")
+    return offenders
+
+
 def test_ports_and_adapters_import_only_inward():
     """설계서 7.2절 — 화살표는 항상 안쪽을 향한다.
 
     `domain/` 은 `tests/test_g1_gate.py` 가 이미 검사한다. 이 테스트는
     `ports/` 와 `adapters/` 가 서로를 잘못 참조하지 않는지 본다.
     """
-    import ast
     import pathlib
 
     root = pathlib.Path(__file__).parent.parent / "src" / "autotrading7s"
@@ -330,26 +373,31 @@ def test_ports_and_adapters_import_only_inward():
     for layer, forbidden in (("domain", ("ports", "adapters")),
                              ("ports", ("adapters",))):
         for path in (root / layer).rglob("*.py"):
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ImportFrom):
-                    module = node.module or ""
-                    level = node.level
-                elif isinstance(node, ast.Import):
-                    module = node.names[0].name
-                    level = 0
-                else:
-                    continue
-                for banned in forbidden:
-                    # 절대 임포트는 "autotrading7s.<banned>" 부분 문자열로
-                    # 잡힌다. 상대 임포트(level > 0, 예: `from ..adapters.sqlite
-                    # import mapping`)는 module 에 "autotrading7s" 접두어가
-                    # 붙지 않으므로(이 경우 module 은 "adapters.sqlite") 위
-                    # 부분 문자열 검사를 그냥 피해간다 — 그래서 level > 0 이면
-                    # 접두어 없이 루트 세그먼트로 다시 대조한다.
-                    absolute_hit = f"autotrading7s.{banned}" in module
-                    relative_hit = level > 0 and module.split(".")[0] == banned
-                    if absolute_hit or relative_hit:
-                        offenders.append(f"{path.name}: {module} (level={level})")
+            for hit in _find_forbidden_imports(
+                path.read_text(encoding="utf-8"), forbidden
+            ):
+                offenders.append(f"{path.name}: {hit}")
 
     assert offenders == [], f"의존 방향 위반: {offenders}"
+
+
+def test_the_import_checker_catches_a_multi_name_plain_import():
+    """`import os, autotrading7s.adapters.x` 처럼 한 문장에 여러 모듈을 실은
+    `ast.Import` — `node.names[0]` 만 보면 놓친다."""
+    source = "import os, autotrading7s.adapters.x\n"
+    assert _find_forbidden_imports(source, ("adapters",)) != []
+
+
+def test_the_import_checker_catches_a_sibling_relative_import():
+    """`from .. import adapters` — `node.module` 이 없고(`None`) 임포트되는
+    이름이 `node.names` 안에 있다. `module` 문자열이나
+    `module.split(".")[0]` 만 보면 이 형태는 아예 검사를 피해간다."""
+    source = "from .. import adapters\n"
+    assert _find_forbidden_imports(source, ("adapters",)) != []
+
+
+def test_the_import_checker_does_not_flag_an_unrelated_relative_import():
+    """형제 패키지를 이름으로 임포트하는 형태를 잡는 규칙이 과잉 반응해
+    금지되지 않은 이름까지 잡으면 안 된다."""
+    source = "from .. import domain\n"
+    assert _find_forbidden_imports(source, ("adapters",)) == []
