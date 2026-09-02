@@ -1060,7 +1060,7 @@ def _config(code: str, name: str, *, amount: int, limit: int) -> SplitConfig:
         config_id=None, stock_code=code, stock_name=name, label=None,
         max_stages=7, drop_pct=Decimal("0.05"), target_pct=Decimal("0.05"),
         amount_per_stage=amount, allow_rebuy=True, rebuy_cooldown_sec=60,
-        total_limit=limit, status="RUNNING", created_at=AT, updated_at=AT,
+        total_limit=limit, status="ACTIVE", created_at=AT, updated_at=AT,
     )
 
 
@@ -1073,14 +1073,15 @@ def _new_repo(tmp_path: Path) -> SqliteRepository:
     return SqliteRepository(conn)
 
 
-def _seed(repo, *, code, name, amount, limit, fills, status="RUNNING"):
+def _seed(repo, *, code, name, amount, limit, fills):
     """단계 1..len(fills) 를 만들고 fills 의 (price, qty) 로 HOLDING 을 만든다.
 
     fills 의 원소가 None 이면 그 단계는 SOLD 로 둔다.
     """
     config_id = repo.save_config(_config(code, name, amount=amount, limit=limit))
+    # create_cycle 이 이미 STARTING 을 반환한다 — cycle.start() 를 다시 부르면
+    # STARTING → STARTING 으로 IllegalCycleTransition 이 난다.
     cyc = repo.create_cycle(config_id, AT)
-    cyc = cycle_mod.start(cyc, at=AT)
     config = repo.load_config(config_id)
     ladder = config.to_ladder(anchor_price=10_000)
     cyc = cycle_mod.confirm_anchor(cyc, anchor_price=10_000, ladder=ladder, at=AT)
@@ -4365,7 +4366,7 @@ async def test_internal_less_warns_but_keeps_trading(repo_two_stocks):
 
     assert samsung.verdict == "INTERNAL_LESS"
     assert samsung.action_taken is None
-    assert repo_two_stocks.load_config(1).status == "RUNNING"
+    assert repo_two_stocks.load_active_cycles()[0].status is CycleStatus.RUNNING
     assert [type(e) for e in events] == [ReconcileMismatch]
 
 
@@ -4389,7 +4390,8 @@ async def test_internal_more_pauses_that_stock(repo_two_stocks):
     cyc = next(c for c in repo_two_stocks.load_active_cycles()
                if c.config_id == 1)
     assert cyc.status is CycleStatus.PAUSED
-    assert repo_two_stocks.load_config(1).status == "PAUSED"
+    # 설정은 ACTIVE 로 남는다 — 일시정지는 사이클의 상태다 (원장 Ruling 1)
+    assert repo_two_stocks.load_config(1).status == "ACTIVE"
     # 다른 종목은 영향받지 않는다 — 종목별 대응이다
     other = next(c for c in repo_two_stocks.load_active_cycles()
                  if c.config_id == 2)
@@ -4598,10 +4600,12 @@ class Reconciler:
                 continue
             verdict = "INTERNAL_LESS" if internal < actual else "INTERNAL_MORE"
             action = None
-            if verdict == "INTERNAL_MORE":
-                if cyc.status is CycleStatus.RUNNING:
-                    self._repo.save_cycle(cycle_mod.pause(cyc))
-                self._repo.set_config_status(cyc.config_id, "PAUSED", at=at)
+            if verdict == "INTERNAL_MORE" and cyc.status is CycleStatus.RUNNING:
+                # 멈추는 것은 **사이클**이다. split_config.status 는
+                # IDLE|ACTIVE 두 값뿐이며(설계서 12.1절·스키마 CHECK) "이
+                # 설정이 사이클을 돌리고 있는가" 만 말한다 — 일시정지는
+                # 사이클의 상태다.
+                self._repo.save_cycle(cycle_mod.pause(cyc))
                 action = "PAUSED"
             self._repo.append_reconcile_log(
                 checked_at=at, stock_code=code, internal_qty=internal,
@@ -4779,7 +4783,7 @@ async def test_startup_reconcile_warns_but_never_pauses(repo_two_stocks):
     cyc = next(c for c in repo_two_stocks.load_active_cycles()
                if c.config_id == 1)
     assert cyc.status is CycleStatus.RUNNING
-    assert repo_two_stocks.load_config(1).status == "RUNNING"
+    assert repo_two_stocks.load_config(1).status == "ACTIVE"
 
 
 @pytest.mark.asyncio
@@ -4818,7 +4822,8 @@ async def test_a_corrupt_cycle_is_isolated_not_fatal(repo_two_stocks):
     assert len(failures) == 1
     assert "stage_state" in failures[0].detail
     assert failures[0].action_taken == "PAUSED"
-    assert repo_two_stocks.load_config(cyc.config_id).status == "PAUSED"
+    assert repo_two_stocks.load_cycle(cyc.cycle_id).status is CycleStatus.PAUSED
+    assert repo_two_stocks.load_config(cyc.config_id).status == "ACTIVE"
     # 손상되지 않은 종목은 계속 복구된다
     assert report.subscribe_codes == ("000660",)
 
@@ -5003,10 +5008,17 @@ class Recovery:
             try:
                 stages = self._repo.load_stages(cyc.cycle_id)
             except CorruptRowError as exc:
-                self._repo.set_config_status(cyc.config_id, "PAUSED", at=at)
+                # 격리는 **사이클**을 멈추는 것이다. RUNNING 일 때만 전이한다 —
+                # STARTING 은 이미 트리거를 받지 않고(accepts_triggers False),
+                # LIQUIDATING 을 되돌리면 진행 중인 긴급청산의 상태를
+                # 프로그램이 뒤집는 것이 된다 (원장 Ruling 5).
+                action = None
+                if cyc.status is CycleStatus.RUNNING:
+                    self._repo.save_cycle(cycle_mod.pause(cyc))
+                    action = "PAUSED"
                 self._emit(CycleLoadFailed(
                     config_id=cyc.config_id, cycle_id=cyc.cycle_id,
-                    detail=str(exc), action_taken="PAUSED", at=at,
+                    detail=str(exc), action_taken=action, at=at,
                 ))
                 failed.append(cyc.cycle_id)
                 continue
@@ -5301,7 +5313,9 @@ async def test_empty_stage_set_pauses_instead_of_crashing(repo_fresh):
 
     events = _drain(event_q)
     assert any(isinstance(e, CycleLoadFailed) for e in events)
-    assert repo_fresh.load_config(1).status == "PAUSED"
+    # 멈추는 것은 사이클이다 — 설정은 ACTIVE 로 남는다 (원장 Ruling 1)
+    assert repo_fresh.load_active_cycles()[0].status is CycleStatus.PAUSED
+    assert repo_fresh.load_config(1).status == "ACTIVE"
 
 
 def test_orchestrator_never_sleeps_on_the_real_clock():
@@ -5439,30 +5453,50 @@ class Orchestrator:
         elif isinstance(command, cmd.StartCycle):
             self._start_cycle(command.config_id)
         elif isinstance(command, cmd.PauseCycle):
-            self._transition(command.config_id, cycle_mod.pause, "PAUSED")
+            self._transition(command.config_id, cycle_mod.pause)
         elif isinstance(command, cmd.ResumeCycle):
-            self._transition(command.config_id, cycle_mod.resume, "RUNNING")
+            self._transition(command.config_id, cycle_mod.resume)
         elif isinstance(command, cmd.StopCycle):
             # D5 — 정지는 자동 트리거를 멈추는 것이고 사이클 종료가 아니다.
-            self._transition(command.config_id, cycle_mod.pause, "PAUSED")
+            self._transition(command.config_id, cycle_mod.pause)
         elif isinstance(command, cmd.ResetReconcileBaseline):
             self._reconciler.reset_baseline(command.stock_code)
         elif isinstance(command, cmd.Shutdown):
             self.stopped = True
 
     def _start_cycle(self, config_id: int) -> None:
-        """앵커는 첫 틱에서 확정된다 — GUI 가 가격을 정하지 않는다."""
-        at = self._clock.now()
-        cycle = self._repo.create_cycle(config_id, at)
-        self._repo.save_cycle(cycle_mod.start(cycle, at=at))
-        self._repo.set_config_status(config_id, "RUNNING", at=at)
+        """앵커는 첫 틱에서 확정된다 — GUI 가 가격을 정하지 않는다.
 
-    def _transition(self, config_id, fn, config_status: str) -> None:
+        `create_cycle` 이 이미 STARTING 사이클을 삽입하고 반환하므로
+        `cycle.start()` 를 다시 부르지 않는다 (원장 Ruling 2).
+        """
         at = self._clock.now()
+        self._repo.create_cycle(config_id, at)
+        self._repo.set_config_status(config_id, "ACTIVE", at=at)
+
+    def _isolate(self, cyc) -> str | None:
+        """데이터 문제가 있는 사이클을 격리한다 — 사이클을 PAUSED 로.
+
+        RUNNING 일 때만 전이한다 (원장 Ruling 5): STARTING 은 이미 트리거를
+        받지 않고(`accepts_triggers` False), LIQUIDATING 을 되돌리면 진행 중인
+        긴급청산의 상태를 프로그램이 뒤집는 것이 된다. 반환값은 **실제로 한
+        것**이며 그대로 이벤트의 `action_taken` 이 된다.
+        """
+        if cyc.status is not CycleStatus.RUNNING:
+            return None
+        self._repo.save_cycle(cycle_mod.pause(cyc))
+        return "PAUSED"
+
+    def _transition(self, config_id: int, fn) -> None:
+        """사이클 상태만 바꾼다.
+
+        `split_config.status` 는 IDLE|ACTIVE 두 값뿐이며(설계서 12.1절·스키마
+        CHECK) "이 설정이 사이클을 돌리고 있는가" 만 말한다. 일시정지는
+        사이클의 상태다 (원장 Ruling 1).
+        """
         for cyc in self._repo.load_active_cycles():
             if cyc.config_id == config_id:
                 self._repo.save_cycle(fn(cyc))
-        self._repo.set_config_status(config_id, config_status, at=at)
 
     # ── 틱 처리 ─────────────────────────────────────────────────────────
     async def on_tick(self, tick: Tick) -> None:
@@ -5477,11 +5511,10 @@ class Orchestrator:
             except (CorruptRowError, DomainInvariantError) as exc:
                 # Plan 1 핸드오버 5 / 2A 핸드오버 7 — 한 사이클의 데이터
                 # 문제가 틱 루프를 죽이면 다른 종목의 매도도 함께 멈춘다.
-                at = self._clock.now()
-                self._repo.set_config_status(cyc.config_id, "PAUSED", at=at)
                 self._emit(CycleLoadFailed(
                     config_id=cyc.config_id, cycle_id=cyc.cycle_id,
-                    detail=str(exc), action_taken="PAUSED", at=at,
+                    detail=str(exc), action_taken=self._isolate(cyc),
+                    at=self._clock.now(),
                 ))
 
     async def _advance(self, cyc, config, tick: Tick) -> None:
@@ -5538,6 +5571,7 @@ class Orchestrator:
             if row.stage_no is None or row.broker_order_id is None:
                 continue
             config_id: int | None = None
+            cyc = None
             try:
                 cyc = self._repo.load_cycle(row.cycle_id)
                 config_id = cyc.config_id
@@ -5555,14 +5589,11 @@ class Orchestrator:
                 # `is_cycle_complete([])` 도 여기로 온다 (Plan 1 핸드오버 5).
                 # 한 사이클의 데이터 문제로 미체결 감시 전체가 멈추면 다른
                 # 종목의 체결 반영도 함께 멈춘다.
-                at = self._clock.now()
-                if config_id is not None:
-                    self._repo.set_config_status(config_id, "PAUSED", at=at)
                 self._emit(CycleLoadFailed(
                     config_id=config_id, cycle_id=row.cycle_id,
                     detail=str(exc),
-                    action_taken="PAUSED" if config_id is not None else None,
-                    at=at,
+                    action_taken=None if cyc is None else self._isolate(cyc),
+                    at=self._clock.now(),
                 ))
 
     def _close_if_complete(self, cyc, config) -> None:
@@ -6288,7 +6319,7 @@ async def test_g2_sell_wins_when_both_trigger(tmp_path):
     cyc = cycle_mod.confirm_anchor(cycle_mod.start(cyc, at=AT),
                                    anchor_price=ANCHOR, ladder=ladder, at=AT)
     repo.save_cycle(cyc)
-    repo.set_config_status(1, "RUNNING", at=AT)
+    repo.set_config_status(1, "ACTIVE", at=AT)
     for n in range(1, 8):
         st = stage_mod.StageState(
             stage_no=n, status=StageStatus.WAITING,
@@ -6531,7 +6562,10 @@ async def test_g2_reconcile_mismatch_pauses(tmp_path):
                   if isinstance(e, ReconcileMismatch)]
     assert [e.verdict for e in mismatches] == ["INTERNAL_MORE"]
     assert mismatches[0].action_taken == "PAUSED"
-    assert repo.load_config(1).status == "PAUSED"
+    cyc = repo._conn.execute("SELECT id FROM cycle").fetchone()["id"]
+    assert repo.load_cycle(cyc).status is CycleStatus.PAUSED
+    # 설정은 ACTIVE 로 남는다 — 일시정지는 사이클의 상태다 (원장 Ruling 1)
+    assert repo.load_config(1).status == "ACTIVE"
 
 
 # ══ 11. 프로세스 강제 종료 후 재시작 복구 ═══════════════════════════════
