@@ -326,7 +326,7 @@ def test_broker_port_is_runtime_checkable():
     """어댑터가 포트를 만족하는지 테스트에서 단정할 수 있어야 한다."""
 
     class Stub:
-        async def subscribe_quotes(self, codes): ...
+        def subscribe_quotes(self, codes): ...   # 포트와 같이 일반 def 다
         async def place_limit_order(self, req): ...
         async def place_market_sell(self, req): ...
         async def cancel_order(self, broker_order_id): ...
@@ -340,9 +340,21 @@ def test_broker_port_is_runtime_checkable():
 
 def test_incomplete_stub_does_not_satisfy_the_port():
     class Missing:
-        async def subscribe_quotes(self, codes): ...
+        def subscribe_quotes(self, codes): ...
 
     assert not isinstance(Missing(), BrokerPort)
+
+
+def test_subscribe_quotes_is_not_a_coroutine_function():
+    """이 결정은 `runtime_checkable` 이 검사하지 않으므로 여기서 고정한다.
+
+    `async def` 로 선언하면 호출이 코루틴을 반환해 호출부가 `async for` 를 바로
+    쓸 수 없다. Plan 3 의 키움 어댑터가 이 결정을 어기면 여기서 잡힌다.
+    """
+    assert not inspect.iscoroutinefunction(BrokerPort.subscribe_quotes)
+    for name in ("place_limit_order", "place_market_sell", "cancel_order",
+                 "get_order", "list_orders_today", "get_balance", "get_price"):
+        assert inspect.iscoroutinefunction(getattr(BrokerPort, name)), name
 ```
 
 - [ ] **Step 2: 테스트 실패 확인**
