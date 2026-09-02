@@ -95,23 +95,20 @@ class _Order:
 class FakeBroker:
     """`BrokerPort` 의 시뮬레이션 구현.
 
-    **브로커 쪽 검증을 모델링하지 않는다.** 체결과 전송 실패(`FailMode`)만
-    흉내낸다 — 예수금 부족이나 보유 부족으로는 절대 거부하지 않는다.
-    `_fill` 은 잔고 검사도 포지션 검사도 하지 않는다: 매수가 계속 들어오면
-    `_cash` 는 조용히 음수가 되고, 실제로는 없는 포지션에 대한 매도도 조용히
-    체결되어 현금을 늘려준다. 그러므로 "브로커가 거부하는지" 에 의존하는
-    테스트는 아무것도 검증하지 못한다 — 이 브로커는 절대 그렇게 답하지
-    않는다.
+    두 계층의 실패를 따로 흉내낸다. `FailMode` 는 **전송 계층**(응답 유실,
+    명시적 거부, 스트림 끊김)이고 `validate_account=True` 는 **거래소
+    계층**(예수금 부족, 보유수량 부족)이다. 전송이 먼저 판정된다 — 실제 순서가
+    그렇고, `fail_after` 가 "실패할 수 있었던 호출 N번" 이라는 의미를 유지한다.
 
-    이 한계는 이번 라운드(Fix Round 3)에서 의도적으로 고치지 않는다 — 거부
-    경로를 추가하면 이 더블의 계약(어떤 예외를 던질지, `INSTANT` 모드에서도
-    체결이 그대로 일어나는지, `fail_mode` 와 어떻게 합성되는지)이 바뀌고,
-    그 설계를 이 수정 라운드 안에서 즉흥적으로 얹는 것은 이 계획이 이미 27번
-    치른 실패 양식이다. **총투입 한도 캡이 이 프로그램의 유일한 구조적
-    보호장치이므로**, 한도를 넘겨 매수하거나 없는 포지션을 매도하는 Plan 2B
-    의 엔진 버그는 이 브로커로 돌리는 모든 테스트를 통과하면서도 실제로는
-    저질러진다. Plan 2B 는 이 더블을 써서 투입한도·긴급청산 가드를 검증하기
-    전에 거부 모드를 먼저 추가해야 한다.
+    **`validate_account` 는 기본 꺼짐이다.** 켜지 않으면 `_cash` 가 조용히
+    음수가 되고 보유 0 인 종목의 매도가 현금을 늘린다. 총투입 한도 캡이 이
+    프로그램의 유일한 구조적 보호장치이므로(설계서 6절), **한도나 긴급청산을
+    검증하는 테스트는 반드시 켜야 한다** — 끄고 돌리면 한도를 넘겨 매수하거나
+    없는 포지션을 매도하는 엔진 버그가 전부 통과한다. G2 게이트는 자기 소스에서
+    모든 생성에 `validate_account=True` 가 있는지 직접 확인한다.
+
+    `holdings` 로 엔진이 모르는 포지션을 미리 심을 수 있다 — 대사 불일치와
+    긴급청산 시나리오(설계서 10.2절·11.1절 ③)의 출발점이다.
     """
 
     def __init__(
@@ -125,6 +122,8 @@ class FakeBroker:
         cash: int = 100_000_000,
         fail_mode: FailMode = FailMode.NONE,
         fail_after: int = 0,
+        validate_account: bool = False,
+        holdings: dict[str, tuple[int, int]] | None = None,
     ) -> None:
         if not script:
             raise ValueError("script must not be empty")
@@ -135,7 +134,10 @@ class FakeBroker:
         self._delay_ticks = delay_ticks
         self._cash = cash
         self._orders: dict[str, _Order] = {}
-        self._positions: dict[str, tuple[int, int]] = {}   # code → (qty, 취득원가합)
+        self._validate_account = validate_account
+        # code → (qty, 취득원가합). `holdings` 로 엔진이 모르는 포지션을 미리
+        # 심을 수 있다 — 대사 불일치와 긴급청산 시나리오의 출발점이다.
+        self._positions: dict[str, tuple[int, int]] = dict(holdings or {})
         self._ticks_consumed = 0
         self._next_id = 1
         self._fail_mode = fail_mode
@@ -211,11 +213,41 @@ class FakeBroker:
             raise BrokerTimeout("no response from broker (simulated)")
         # DISCONNECT 는 시세 스트림 전용이다 — 주문 경로를 막지 않는다. 설계서
         # 8.4절: WS 가 끊겨도 REST 폴링으로 전환해 트리거 판정과 발주는 계속된다.
+        if self._validate_account:
+            self._validate(code, side, qty, price)
         return OrderAck(
             client_ref=client_ref,
             broker_order_id=self._register(client_ref, code, side, qty, price),
             accepted_at=_EPOCH,
         )
+
+    def _validate(
+        self, code: str, side: Side, qty: int, price: int | None
+    ) -> None:
+        """거래소 계층의 거부. `validate_account=True` 일 때만 동작한다.
+
+        `FailMode` 뒤에 오는 이유: `FailMode` 는 전송 계층(응답 유실)을
+        모델링하고 이것은 거래소 계층이다. 순서를 뒤집으면 `fail_after` 가
+        "실패할 수 있었던 호출 N번" 이라는 의미를 잃는다.
+
+        매도 검증은 **요청 수량** 기준이다. 체결 수량으로 검증하면 부분체결로
+        조금씩 팔아 없는 포지션을 비울 수 있다.
+        """
+        if side is Side.BUY:
+            # 매수는 지정가만 존재한다 — 자동 트리거 경로에 시장가가 없다
+            # (설계서 8.2절). price 가 None 인 매수는 만들 수 없다.
+            assert price is not None
+            need = price * qty
+            if need > self._cash:
+                raise BrokerRejected(
+                    "40940", f"예수금 부족: 필요 {need:,} > 보유 {self._cash:,}"
+                )
+            return
+        held_qty, _ = self._positions.get(code, (0, 0))
+        if qty > held_qty:
+            raise BrokerRejected(
+                "40950", f"보유수량 부족: 요청 {qty:,} > 보유 {held_qty:,}"
+            )
 
     def _register(
         self, client_ref: UUID, code: str, side: Side, qty: int, price: int | None
