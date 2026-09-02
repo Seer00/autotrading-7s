@@ -23,7 +23,7 @@ from autotrading7s.app.events import Event
 class EngineThread:
     def __init__(
         self, *, orchestrator_factory: Callable[..., Any],
-        recovery_factory: Callable[[], Any],
+        recovery_factory: Callable[..., Any],
     ) -> None:
         self.command_q: queue.Queue = queue.Queue()
         self.priority_q: queue.Queue = queue.Queue()
@@ -50,7 +50,10 @@ class EngineThread:
             self._error = exc
 
     async def _main(self) -> None:
-        await self._recovery_factory().run()
+        # 복구도 이벤트를 낸다 — **기동 직후가 CycleLoadFailed·ReconcileMismatch
+        # 가 가장 나올 만한 시점이므로** event_q 를 넘겨야 한다. 넘기지 않으면
+        # 정확히 필요한 순간에 화면이 조용하다.
+        await self._recovery_factory(event_q=self.event_q).run()
         self._orchestrator = self._orchestrator_factory(
             command_q=self.command_q, priority_q=self.priority_q,
             event_q=self.event_q,
