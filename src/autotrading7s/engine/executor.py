@@ -29,13 +29,27 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
-from autotrading7s.app.events import Event, OrderRejected, OrderUnknown
+from autotrading7s.app.events import (
+    Event,
+    OrderRejected,
+    OrderUnknown,
+    StageFilled,
+)
 from autotrading7s.domain import stage as stage_mod
 from autotrading7s.domain.cycle import Cycle
 from autotrading7s.domain.rules import BuyStage, SellStage
 from autotrading7s.domain.stage import StageState
-from autotrading7s.domain.types import LimitOrderRequest, OrderPath, Side, Tick
+from autotrading7s.domain.types import (
+    FillState,
+    LimitOrderRequest,
+    OrderPath,
+    OrderStatus,
+    Side,
+    StageStatus,
+    Tick,
+)
 from autotrading7s.ports.broker import (
     BrokerError,
     BrokerPort,
@@ -61,6 +75,23 @@ class SendOutcome:
     def __post_init__(self) -> None:
         if self.status not in SEND_STATUSES:
             raise ValueError(f"unknown send status: {self.status!r}")
+
+
+FILL_ACTIONS = frozenset(
+    {"FILLED", "PARTIAL_CONFIRMED", "CANCELED_UNFILLED", "STILL_OPEN", "GONE"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class FillOutcome:
+    action: str
+    stage: StageState
+    filled_qty: int
+    filled_price: int | None
+
+    def __post_init__(self) -> None:
+        if self.action not in FILL_ACTIONS:
+            raise ValueError(f"unknown fill action: {self.action!r}")
 
 
 class Executor:
@@ -173,6 +204,127 @@ class Executor:
         )
         restored = self._restore(cycle, stage, pending, is_buy)
         return SendOutcome("UNKNOWN_NOT_SENT", str(client_ref), None, restored)
+
+    async def poll_fill(
+        self, *, cycle: Cycle, config: SplitConfig, stage: StageState,
+        client_ref: str, broker_order_id: str, sent_at: datetime,
+        timeout_sec: int,
+    ) -> FillOutcome:
+        """설계서 9절 ⑥ — 체결 대기와 3초 타임아웃.
+
+        `stage` 는 PENDING 상태여야 한다. 매수/매도는 그 상태에서 읽는다 —
+        인자로 따로 받으면 두 정보가 어긋날 수 있다.
+
+        브로커가 보고하는 `filled_qty` 는 **누적**, `filled_price` 는
+        **수량가중평균**이며 그대로 `update_order_log` 에 넘긴다 (2A 핸드오버
+        6). 증분으로 다루면 취득원가가 과소 계상되어 사용자에게 보고되는
+        이익이 부풀려진다.
+        """
+        if stage.status is StageStatus.BUY_PENDING:
+            is_buy = True
+        elif stage.status is StageStatus.SELL_PENDING:
+            is_buy = False
+        else:
+            raise ValueError(
+                f"poll_fill requires a pending stage, got {stage.status}"
+            )
+
+        status = await self._broker.get_order(broker_order_id)
+        now = self._clock.now()
+
+        if status.state is FillState.REJECTED:
+            self._repo.update_order_log(
+                client_ref=client_ref, status="REJECTED",
+                api_code=status.api_code, api_message=status.api_message,
+                settled_at=now,
+            )
+            restored = self._restore(cycle, stage, stage, is_buy)
+            self._emit(OrderRejected(
+                config_id=config.config_id, cycle_id=cycle.cycle_id,
+                stage_no=stage.stage_no, api_code=status.api_code,
+                api_message=status.api_message, at=now,
+            ))
+            return FillOutcome("GONE", restored, 0, None)
+
+        if status.state is FillState.FILLED:
+            return self._apply_fill(
+                cycle=cycle, config=config, stage=stage, status=status,
+                client_ref=client_ref, is_buy=is_buy, now=now,
+                action="FILLED", terminal_status="FILLED",
+            )
+
+        if status.filled_qty > 0:
+            # 누적 체결을 기록한다. settled_at 을 넣지 않는 이유: PARTIAL 은
+            # 아직 종결이 아니고, 종결로 기록하면 2A 의 체결값 불변 가드가
+            # 이후의 정상 갱신(PARTIAL → FILLED)을 거부한다.
+            self._repo.update_order_log(
+                client_ref=client_ref, status="PARTIAL",
+                fill_price=status.filled_price, fill_qty=status.filled_qty,
+            )
+
+        if now - sent_at < timedelta(seconds=timeout_sec):
+            return FillOutcome("STILL_OPEN", stage, status.filled_qty,
+                               status.filled_price)
+
+        # 타임아웃 — 잔량을 취소한다
+        try:
+            await self._broker.cancel_order(broker_order_id)
+        except BrokerError:
+            # 취소 실패는 브로커에 주문이 살아 있다는 뜻이므로 PENDING 이
+            # 사실이다. 다음 폴에서 재시도되고, 규칙 5 가 이 단계를 판정에서
+            # 제외하므로 중복 발주는 없다.
+            return FillOutcome("STILL_OPEN", stage, status.filled_qty,
+                               status.filled_price)
+
+        if status.filled_qty > 0:
+            return self._apply_fill(
+                cycle=cycle, config=config, stage=stage, status=status,
+                client_ref=client_ref, is_buy=is_buy, now=now,
+                action="PARTIAL_CONFIRMED", terminal_status="CANCELED",
+            )
+
+        self._repo.update_order_log(
+            client_ref=client_ref, status="CANCELED", settled_at=now,
+        )
+        restored = self._restore(cycle, stage, stage, is_buy)
+        return FillOutcome("CANCELED_UNFILLED", restored, 0, None)
+
+    def _apply_fill(
+        self, *, cycle: Cycle, config: SplitConfig, stage: StageState,
+        status: OrderStatus, client_ref: str, is_buy: bool, now: datetime,
+        action: str, terminal_status: str,
+    ) -> FillOutcome:
+        """체결을 단계에 반영한다 — 매수와 매도의 비대칭이 여기 있다.
+
+        매수 부분체결은 체결분으로 **보유를 만든다**(설계서 200행). 매도
+        부분체결은 체결분만큼 **보유를 줄인다** — 잔량이 취소되어 돌아오는
+        것이 `cancel_sell` 의 존재 이유다.
+        """
+        self._repo.update_order_log(
+            client_ref=client_ref, status=terminal_status,
+            fill_price=status.filled_price, fill_qty=status.filled_qty,
+            settled_at=now,
+        )
+        if is_buy:
+            applied = stage_mod.to_holding(
+                stage, fill_price=status.filled_price,
+                fill_qty=status.filled_qty, at=now,
+            )
+        elif status.filled_qty >= stage.fill_qty:
+            applied = stage_mod.after_sell(stage, at=now,
+                                           allow_rebuy=config.allow_rebuy)
+        else:
+            applied = stage_mod.cancel_sell(
+                stage, remaining_qty=stage.fill_qty - status.filled_qty,
+            )
+        self._repo.save_stage(cycle.cycle_id, applied)
+        self._emit(StageFilled(
+            config_id=config.config_id, cycle_id=cycle.cycle_id,
+            stage_no=stage.stage_no, side="BUY" if is_buy else "SELL",
+            fill_price=status.filled_price, fill_qty=status.filled_qty, at=now,
+        ))
+        return FillOutcome(action, applied, status.filled_qty,
+                           status.filled_price)
 
     def _restore(
         self, cycle: Cycle, original: StageState, pending: StageState,
