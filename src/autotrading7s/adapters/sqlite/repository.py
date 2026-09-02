@@ -621,6 +621,45 @@ class SqliteRepository:
             )
         return int(cursor.lastrowid)
 
+    def forced_close_baseline(self, stock_code: str) -> int:
+        """이 종목에서 강제 종료된 누적 수량 — 마지막 기준선 초기화 이후만.
+
+        설계서 11.4절은 `forced_close_qty` 를 종목별로 누적해 대사 기준선으로
+        삼고 사용자가 초기화할 수단을 두라고 요구한다. 초기화 시점을 담을
+        컬럼이 없고 스키마는 버전 1을 넘는 마이그레이션 경로가 없으므로
+        (`CREATE TABLE IF NOT EXISTS` 는 기존 테이블을 바꾸지 못한다),
+        초기화를 `reconcile_log` 의 `action_taken='BASELINE_RESET'` 행으로
+        표현한다.
+
+        `closed_at > ''` 비교가 성립하는 이유: `closed_at` 은 ISO-8601 TEXT
+        이고 SQLite 의 문자열 비교는 사전순이며 ISO-8601 은 사전순 = 시간순이다
+        (코덱이 그 형식을 보장한다). 초기화가 없으면 `''` 가 모든 시각보다
+        작으므로 전체가 집계된다.
+        """
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(c.forced_close_qty), 0) AS total "
+            "FROM cycle c JOIN split_config s ON s.id = c.config_id "
+            "WHERE s.stock_code = ? AND c.close_reason = 'FORCED' "
+            "  AND c.closed_at > COALESCE(("
+            "     SELECT MAX(checked_at) FROM reconcile_log "
+            "     WHERE stock_code = ? AND action_taken = 'BASELINE_RESET'"
+            "  ), '')",
+            (stock_code, stock_code),
+        ).fetchone()
+        return int(dict(row)["total"])
+
+    def reset_forced_close_baseline(
+        self, stock_code: str, *, at: datetime
+    ) -> None:
+        """사용자가 남은 주식을 처리했다고 알린 시점을 기록한다.
+
+        설계서 11.4절 — 대사 제외는 영구적이지 않다.
+        """
+        self.append_reconcile_log(
+            checked_at=at, stock_code=stock_code, internal_qty=0,
+            broker_qty=0, verdict="MATCH", action_taken="BASELINE_RESET",
+        )
+
     # ── 보유현황 뷰 ─────────────────────────────────────────────────────
     def holdings(self) -> list[HoldingRow]:
         """설계서 12.3절의 뷰를 읽어 HoldingRow 로 변환한다.

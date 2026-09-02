@@ -356,6 +356,20 @@ class RepositoryPort(Protocol):
         broker_qty: int, verdict: str, action_taken: str | None,
     ) -> int: ...
 
+    def forced_close_baseline(self, stock_code: str) -> int:
+        """이 종목에서 강제 종료된 누적 수량 — 마지막 기준선 초기화 이후만.
+
+        설계서 11.4절: 강제 종료된 수량을 대사 기준에서 제외해야 하고, 그
+        제외는 영구적이지 않아야 한다.
+        """
+        ...
+
+    def reset_forced_close_baseline(
+        self, stock_code: str, *, at: datetime
+    ) -> None:
+        """사용자가 남은 주식을 처리했다고 알린 시점을 기록한다 (설계서 11.4절)."""
+        ...
+
     # ── 보유현황 뷰 ─────────────────────────────────────────────────────
     def holdings(self) -> list[HoldingRow]:
         """설계서 12.3절의 holdings 뷰. 현재가·평가손익은 UI 가 최신 틱과 결합한다."""

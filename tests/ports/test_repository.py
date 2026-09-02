@@ -44,6 +44,7 @@ def test_repository_port_declares_the_expected_methods():
         "realized_pnl_for_cycle", "set_realized_pnl",
         # 긴급청산·대사 이력
         "append_emergency_log", "append_reconcile_log",
+        "forced_close_baseline", "reset_forced_close_baseline",
         # 보유현황 뷰
         "holdings",
     }
