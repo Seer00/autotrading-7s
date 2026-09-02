@@ -3098,7 +3098,6 @@ def test_holdings_avg_price_truncates(repo):
     # 이 조합은 소수부가 0.5 를 넘으므로 절사와 반올림이 1원 갈린다.
     assert invested / qty > invested // qty + 0.5
     assert repo.holdings()[0].avg_price == 9_695   # 반올림이면 9,696 이다
-    conn.close()
 
 
 def test_holdings_counts_sell_pending_as_held():
@@ -3218,13 +3217,13 @@ Run:
 .venv/bin/python -m pytest tests/ -q
 ```
 Expected: PASS (10 tests + 기존 전부). 특히 `test_repository_satisfies_the_port` 가
-통과해야 한다 — Task 3 이 고정한 18개 메서드를 전부 채웠다는 뜻이다.
+통과해야 한다 — Task 3 이 고정한 17개 메서드를 전부 채웠다는 뜻이다.
 
 - [ ] **Step 5: 커밋**
 
 ```bash
 git add src/autotrading7s/adapters/sqlite/repository.py tests/adapters/sqlite/test_repository_logs.py
-git commit -m "$(printf 'feat: 긴급청산·대사 이력과 holdings 뷰\n\nTask 3 이 고정한 18개 메서드를 전부 채웠다 — isinstance(repo, RepositoryPort) 가\n이제 참이다.\n\n긴급청산 이력은 D20 의 강제 종료를 result=FORCED_CLOSE 로 받는다. 스키마의 CHECK\n제약이 알 수 없는 result 를 거부하는 것도 테스트로 고정했다.\n\nholdings 뷰의 avg_price 는 SQL 정수 나눗셈이므로 절사이고 domain/pnl.py 의\navg_price 는 half-up 반올림이다 — 소수부가 0.5 이상일 때 1원 갈린다. 설계서\n목업은 소수부가 0.5 미만이라 두 방식이 같으므로, 절사를 실제로 가르는 테스트를\n따로 두었다. UI 는 뷰의 값을\n표시용으로 쓰되 손익 계산에는 도메인 함수를 써야 한다. 그 차이를 docstring 에\n적고 테스트도 절사를 기대한다.')"
+git commit -m "$(printf 'feat: 긴급청산·대사 이력과 holdings 뷰\n\nTask 3 이 고정한 17개 메서드를 전부 채웠다 — isinstance(repo, RepositoryPort) 가\n이제 참이다.\n\n긴급청산 이력은 D20 의 강제 종료를 result=FORCED_CLOSE 로 받는다. 스키마의 CHECK\n제약이 알 수 없는 result 를 거부하는 것도 테스트로 고정했다.\n\nholdings 뷰의 avg_price 는 SQL 정수 나눗셈이므로 절사이고 domain/pnl.py 의\navg_price 는 half-up 반올림이다 — 소수부가 0.5 이상일 때 1원 갈린다. 설계서\n목업은 소수부가 0.5 미만이라 두 방식이 같으므로, 절사를 실제로 가르는 테스트를\n따로 두었다. UI 는 뷰의 값을\n표시용으로 쓰되 손익 계산에는 도메인 함수를 써야 한다. 그 차이를 docstring 에\n적고 테스트도 절사를 기대한다.')"
 ```
 
 ---
@@ -4409,7 +4408,7 @@ Plan 2A 완료 시 다음이 모두 통과해야 한다.
 - [ ] `load_stages` 가 불완전한 집합을 거부한다 (H3)
 - [ ] `load_stages` 가 `trigger_price` 불일치를 거부한다 (H4)
 - [ ] `realized_pnl_for_cycle` 이 `order_log` 에서 집계한다 (H5)
-- [ ] `SqliteRepository` 가 `RepositoryPort` 를 만족한다 (18개 메서드)
+- [ ] `SqliteRepository` 가 `RepositoryPort` 를 만족한다 (17개 메서드)
 - [ ] `FakeBroker` 가 `BrokerPort` 를 만족하고 결정론적이다
 - [ ] 네 체결 모드(`INSTANT`·`DELAYED`·`PARTIAL`·`NEVER`)가 동작하고, `PARTIAL` 이 0주를 체결하지 않는다
 - [ ] 세 실패 모드(`TIMEOUT`·`REJECT`·`DISCONNECT`)가 동작하고, `TIMEOUT` 이 주문을 접수한 뒤 던진다
