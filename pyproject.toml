@@ -19,6 +19,7 @@ where = ["src"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-q --strict-markers"
+asyncio_mode = "strict"
 
 [tool.coverage.run]
 source = ["autotrading7s.domain"]
