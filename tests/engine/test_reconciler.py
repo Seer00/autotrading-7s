@@ -10,7 +10,7 @@ from autotrading7s.adapters.fake.clock import FakeClock
 from autotrading7s.app.events import Event, ReconcileMismatch
 from autotrading7s.domain import cycle as cycle_mod
 from autotrading7s.domain import stage as stage_mod
-from autotrading7s.domain.types import CycleStatus
+from autotrading7s.domain.types import CycleStatus, StageStatus
 from autotrading7s.engine.reconciler import Reconciler
 
 AT = datetime(2026, 9, 2, 11, 0, tzinfo=UTC)
@@ -150,14 +150,34 @@ async def test_forced_quantity_is_excluded_from_reconciliation(repo_two_stocks):
     무시된다.
     """
     _force_close_first_cycle(repo_two_stocks, qty=100)
-    # 실계좌에는 강제 종료된 100주가 그대로 남아 있다
+    # **다음 사이클을 시작해야 기준선이 의미를 갖는다.** 강제 종료된 사이클은
+    # CLOSED 라 load_active_cycles 에 들어오지 않으므로, 새 사이클이 없으면
+    # 대사가 그 종목을 아예 보지 않고 기준선도 조회되지 않는다. 설계서 11.4절이
+    # 말하는 상황은 정확히 "다음 사이클을 시작하면 새 앵커로 시작하며, 남은
+    # 주식은 내부 기록에 존재하지 않는다" 이다.
+    config = repo_two_stocks.load_config(1)
+    ladder = config.to_ladder(anchor_price=10_000)
+    fresh = repo_two_stocks.create_cycle(1, AT)
+    repo_two_stocks.save_cycle(cycle_mod.confirm_anchor(
+        fresh, anchor_price=10_000, ladder=ladder, at=AT))
+    for n in range(1, ladder.max_stages + 1):
+        repo_two_stocks.save_stage(fresh.cycle_id, stage_mod.StageState(
+            stage_no=n, status=StageStatus.WAITING,
+            trigger_price=ladder.trigger_price(n),
+            planned_qty=ladder.planned_qty(n)))
+
+    # 실계좌에는 강제 종료된 100주가 그대로 남아 있고, 새 사이클의 내부 보유는 0 이다
     broker = FakeBroker([10_000], holdings={"005930": (100, 1_000_000),
                                             "000660": (100, 600_000)})
     rec, events = _rec(repo_two_stocks, broker)
 
     reports = await rec.run_once()
 
-    assert {r.verdict for r in reports} == {"MATCH"}
+    samsung = next(r for r in reports if r.stock_code == "005930")
+    assert samsung.baseline == 100
+    assert samsung.internal_qty == 0
+    assert samsung.broker_qty == 0          # 100 − 기준선 100
+    assert samsung.verdict == "MATCH"
     assert events == []
 
 

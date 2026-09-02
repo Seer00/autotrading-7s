@@ -72,6 +72,17 @@ async def test_priority_queue_is_consumed_first(repo_two_stocks):
                         holdings={"005930": (100, 1_000_000)})
     orch, clock, (command_q, priority_q, event_q) = _build(repo_two_stocks,
                                                            broker)
+    # **소비 순서를 직접 관측한다.** 이벤트 순서로는 구별되지 않는다 —
+    # PauseCycle 은 이벤트를 내지 않으므로, 우선순위가 뒤바뀌어도 첫 이벤트는
+    # 여전히 EmergencyResult 다. 그 테스트는 통과하지만 아무것도 지키지 않는다.
+    seen: list[str] = []
+    original = orch._handle
+
+    async def spy(command):
+        seen.append(type(command).__name__)
+        await original(command)
+
+    orch._handle = spy                      # type: ignore[method-assign]
     for _ in range(100):
         command_q.put(PauseCycle(config_id=2))
     priority_q.put(EmergencyLiquidate(scope="SINGLE", config_id=1,
@@ -79,6 +90,9 @@ async def test_priority_queue_is_consumed_first(repo_two_stocks):
 
     await orch.drain_commands()
 
+    assert seen[0] == "EmergencyLiquidate", (
+        "priority_q 를 먼저 비우지 않으면 급락 중에 청산이 100건 뒤로 밀린다")
+    assert seen.count("PauseCycle") == 100
     events = _drain(event_q)
     assert isinstance(events[0], EmergencyResult)
     assert events[0].result == "SUCCESS"
