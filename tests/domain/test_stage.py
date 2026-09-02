@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -149,6 +150,85 @@ def test_illegal_transitions_are_rejected(from_status: StageStatus, action: str)
 
 
 @pytest.mark.parametrize(
+    ("from_status", "action"),
+    [
+        # 표는 이 전이들을 허용한다(같은 목표에 다른 출발이 도달) 하지만
+        # 이 도우미는 그 출발을 위한 것이 아니다.
+        (StageStatus.SELL_PENDING, "cancel_buy"),  # WAITING 목표는 after_sell 의 몫
+        (StageStatus.BUY_PENDING, "cancel_sell"),  # HOLDING 목표는 to_holding 의 몫
+        (StageStatus.SELL_PENDING, "to_holding"),  # HOLDING 목표는 cancel_sell 의 몫
+        (StageStatus.BUY_PENDING, "after_sell"),   # WAITING 목표는 cancel_buy 의 몫
+    ],
+)
+def test_wrong_source_helper_rejected_even_though_table_allows_target(
+    from_status: StageStatus, action: str
+):
+    """`_ALLOWED` 가 목표 상태를 허용해도, 도우미가 노리는 출발 상태가
+    아니면 거부한다. `to_holding(SELL_PENDING)` 은 표만으로는 통과하지만
+    실제로는 보유 기록을 조용히 덮어쓰는 가장 위험한 경우다."""
+    st = StageState(
+        stage_no=3, status=from_status, trigger_price=9_000, planned_qty=111,
+        fill_price=9_000, fill_qty=111,
+    )
+    fn = {
+        "cancel_buy": lambda s: cancel_buy(s),
+        "cancel_sell": lambda s: cancel_sell(s, remaining_qty=50),
+        "to_holding": lambda s: to_holding(s, fill_price=1, fill_qty=1, at=T0),
+        "after_sell": lambda s: after_sell(s, at=T0, allow_rebuy=True),
+    }[action]
+    with pytest.raises(IllegalStageTransition):
+        fn(st)
+
+
+def test_to_holding_wrong_source_does_not_overwrite_recorded_fill():
+    """가장 위험한 오배선을 데이터 파괴 관점에서 못박는다.
+
+    `to_holding` 을 SELL_PENDING 상태에 걸면 표는 통과시키지만, 실제로는
+    9,000×111 로 기록된 포지션을 1×1 로 덮어써 버린다. 예외가 필드를
+    건드리기 전에 나야 하며, 원본 `st` 는 (frozen 이므로 항상 그렇지만)
+    호출 전후로 값이 그대로여야 한다.
+    """
+    st = StageState(
+        stage_no=3, status=StageStatus.SELL_PENDING, trigger_price=9_000,
+        planned_qty=111, fill_price=9_000, fill_qty=111,
+    )
+    with pytest.raises(IllegalStageTransition):
+        to_holding(st, fill_price=1, fill_qty=1, at=T0)
+    assert (st.fill_price, st.fill_qty) == (9_000, 111), "원본 기록은 파괴되지 않는다"
+
+
+def test_to_buy_pending_succeeds_from_waiting():
+    st = to_buy_pending(waiting())
+    assert st.status is StageStatus.BUY_PENDING
+
+
+def test_to_holding_succeeds_from_buy_pending():
+    st = to_holding(to_buy_pending(waiting()), fill_price=9_480, fill_qty=105, at=T0)
+    assert st.status is StageStatus.HOLDING
+    assert st.fill_qty == 105
+
+
+def test_to_sell_pending_succeeds_from_holding():
+    st = to_sell_pending(holding())
+    assert st.status is StageStatus.SELL_PENDING
+
+
+def test_after_sell_succeeds_from_sell_pending():
+    st = after_sell(to_sell_pending(holding()), at=T0, allow_rebuy=True)
+    assert st.status is StageStatus.WAITING
+
+
+def test_cancel_buy_succeeds_from_buy_pending():
+    st = cancel_buy(to_buy_pending(waiting()))
+    assert st.status is StageStatus.WAITING
+
+
+def test_cancel_sell_succeeds_from_sell_pending():
+    st = cancel_sell(to_sell_pending(holding()), remaining_qty=105)
+    assert st.status is StageStatus.HOLDING
+
+
+@pytest.mark.parametrize(
     "status",
     [StageStatus.WAITING, StageStatus.BUY_PENDING, StageStatus.HOLDING,
      StageStatus.SELL_PENDING],
@@ -219,6 +299,55 @@ def test_holding_rejects_zero_or_negative_fill():
             stage_no=2, status=StageStatus.HOLDING, trigger_price=9_500,
             planned_qty=105, fill_price=9_480, fill_qty=0,
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("fill_price", 9_000.5),
+        ("fill_qty", 111.5),
+        ("fill_price", True),
+        ("fill_qty", True),
+        ("fill_price", Decimal(9_000)),
+    ],
+)
+def test_holding_rejects_non_int_fill(field: str, bad_value: object):
+    """float·bool·Decimal 은 모두 `<= 0` 비교를 통과하므로 타입을 직접
+    확인해야 한다 — 그러지 않으면 실수 수량이 조용히 fill_qty 로
+    들어가 invested_amount 등 금액 계산까지 float 로 오염시킨다."""
+    kwargs = {"fill_price": 9_000, "fill_qty": 111}
+    kwargs[field] = bad_value
+    with pytest.raises(TypeError, match=f"{field} must be int"):
+        StageState(
+            stage_no=3, status=StageStatus.HOLDING, trigger_price=9_000,
+            planned_qty=111, **kwargs,
+        )
+
+
+def test_to_holding_rejects_non_int_fill_via_invariant():
+    """to_holding 은 자체 타입 검사가 없다 — StageState.__post_init__ 이
+    replace() 를 거쳐 대신 잡아준다."""
+    st = to_buy_pending(waiting())
+    with pytest.raises(TypeError, match="fill_price must be int"):
+        to_holding(st, fill_price=9_000.5, fill_qty=105, at=T0)
+
+    st = to_buy_pending(waiting())
+    with pytest.raises(TypeError, match="fill_qty must be int"):
+        to_holding(st, fill_price=9_000, fill_qty=True, at=T0)
+
+
+@pytest.mark.parametrize("bad_value", [50.5, True])
+def test_cancel_sell_rejects_non_int_remaining_qty(bad_value: object):
+    """예외 메시지가 remaining_qty 를 가리켜야 한다 — fill_qty 를 가리키면
+    호출자가 어느 인자를 잘못 넘겼는지 알 수 없다."""
+    with pytest.raises(TypeError, match="remaining_qty must be int"):
+        cancel_sell(to_sell_pending(holding()), remaining_qty=bad_value)
+
+
+def test_cancel_sell_accepts_valid_int_remaining_qty():
+    st = cancel_sell(to_sell_pending(holding()), remaining_qty=71)
+    assert st.fill_qty == 71
+    assert type(st.fill_qty) is int
 
 
 def test_non_holding_statuses_allow_no_fill():

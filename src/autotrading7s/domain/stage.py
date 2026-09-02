@@ -63,16 +63,28 @@ class StageState:
         이 불변식을 위반한다. 따라서 경계에서의 보호가 필수다.
         """
         if self.status in (StageStatus.HOLDING, StageStatus.SELL_PENDING):
-            if self.fill_price is None or self.fill_price <= 0:
-                raise ValueError(
-                    f"status {self.status.value}: fill_price must be positive, "
-                    f"got {self.fill_price}"
-                )
-            if self.fill_qty is None or self.fill_qty <= 0:
-                raise ValueError(
-                    f"status {self.status.value}: fill_qty must be positive, "
-                    f"got {self.fill_qty}"
-                )
+            self._check_fill_field("fill_price", self.fill_price)
+            self._check_fill_field("fill_qty", self.fill_qty)
+
+    def _check_fill_field(self, name: str, value: int | None) -> None:
+        """`fill_price`/`fill_qty` 공통 검증: 존재 → 타입 → 양수, 이 순서로.
+
+        타입 검사가 양수 비교보다 먼저 와야 한다 — float·bool·Decimal 은
+        모두 ``<= 0`` 비교를 통과하므로, 타입을 확인하지 않으면 실수
+        수량(예: 50.5)이 조용히 ``fill_qty`` 로 들어가 이후
+        ``invested_amount`` 등 금액 계산까지 float 로 오염시킨다
+        (설계서 3.1절 — float 금지).
+        """
+        if value is None:
+            raise ValueError(
+                f"status {self.status.value}: {name} must be positive, got {value}"
+            )
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be int, not {type(value).__name__}")
+        if value <= 0:
+            raise ValueError(
+                f"status {self.status.value}: {name} must be positive, got {value}"
+            )
 
 
 def _guard(state: StageState, to: StageStatus) -> None:
@@ -82,7 +94,28 @@ def _guard(state: StageState, to: StageStatus) -> None:
         )
 
 
+def _require_source(state: StageState, expected: StageStatus, fn_name: str) -> None:
+    """도우미가 노리는 출발 상태와 실제 출발 상태가 맞는지 확인한다.
+
+    ``_guard`` 는 "이 목표 상태가 표에 있는가"를 묻는다. 이 함수는 그와
+    다른 질문 — "이 도우미가 이 출발 상태에 맞는 도우미인가" — 를 묻는다.
+    ``_ALLOWED`` 는 여러 출발 상태가 같은 목표에 도달하는 것을 허용한다
+    (예: HOLDING ← BUY_PENDING, SELL_PENDING). 도우미 하나는 그중 정확히
+    하나의 전이만 의미하므로, 표만으로는 잘못된 도우미가 잘못된 출발
+    상태에서 호출되는 것을 막지 못한다 — 예를 들어 ``to_holding`` 을
+    SELL_PENDING 에 호출하면 표는 통과시키지만 그 기록을 조용히 덮어쓴다.
+    이 검사를 ``_guard`` 보다 먼저 실행해야, 잘못 걸린 도우미가 그 사실을
+    보고하고 필드를 건드리기 전에 멈춘다.
+    """
+    if state.status is not expected:
+        raise IllegalStageTransition(
+            f"stage {state.stage_no}: {fn_name}() 는 {expected.value} 에서만 "
+            f"호출할 수 있음, 실제 상태는 {state.status.value}"
+        )
+
+
 def to_buy_pending(state: StageState) -> StageState:
+    _require_source(state, StageStatus.WAITING, "to_buy_pending")
     _guard(state, StageStatus.BUY_PENDING)
     return replace(state, status=StageStatus.BUY_PENDING)
 
@@ -95,6 +128,7 @@ def to_holding(
     부분체결이면 ``fill_qty`` 가 ``planned_qty`` 보다 작다. 설계서 4.1절에 따라
     체결 수량만으로 확정하며 잔량을 쫓지 않는다.
     """
+    _require_source(state, StageStatus.BUY_PENDING, "to_holding")
     _guard(state, StageStatus.HOLDING)
     if fill_price <= 0 or fill_qty <= 0:
         raise ValueError(f"invalid fill: price={fill_price} qty={fill_qty}")
@@ -108,6 +142,7 @@ def to_holding(
 
 
 def to_sell_pending(state: StageState) -> StageState:
+    _require_source(state, StageStatus.HOLDING, "to_sell_pending")
     _guard(state, StageStatus.SELL_PENDING)
     return replace(state, status=StageStatus.SELL_PENDING)
 
@@ -118,6 +153,7 @@ def after_sell(state: StageState, *, at: datetime, allow_rebuy: bool) -> StageSt
     ``allow_rebuy`` 면 WAITING 으로 복귀하여 같은 발동가에서 재매수 대상이 되고,
     아니면 SOLD 로 종료된다. 발동가는 사다리에 고정되어 있어 변하지 않는다.
     """
+    _require_source(state, StageStatus.SELL_PENDING, "after_sell")
     target = StageStatus.WAITING if allow_rebuy else StageStatus.SOLD
     _guard(state, target)
     return replace(
@@ -133,6 +169,7 @@ def after_sell(state: StageState, *, at: datetime, allow_rebuy: bool) -> StageSt
 
 def cancel_buy(state: StageState) -> StageState:
     """매수 주문 미체결 취소 → 대기 복귀. 다음 틱에 재시도된다."""
+    _require_source(state, StageStatus.BUY_PENDING, "cancel_buy")
     _guard(state, StageStatus.WAITING)
     return replace(state, status=StageStatus.WAITING)
 
@@ -146,7 +183,17 @@ def cancel_sell(state: StageState, *, remaining_qty: int) -> StageState:
     (설계서 9절). 전혀 체결되지 않은 취소(``remaining_qty ==
     state.fill_qty``)는 그 특수 케이스일 뿐, 별도 분기가 아니다.
     """
+    _require_source(state, StageStatus.SELL_PENDING, "cancel_sell")
     _guard(state, StageStatus.HOLDING)
+    # remaining_qty 를 여기서도 검사한다. StageState.__post_init__ 이 최종
+    # 방어선이지만, 그 예외는 fill_qty 라는 이름으로 나기 때문에 호출자가
+    # remaining_qty 를 잘못 넘겼다는 것을 알 수 없다. to_holding 과
+    # __post_init__ 사이의 관계와 같은 의도된 이중 방어이며, 나중에 이
+    # 검사를 "중복이니 지운다"고 지우면 안 된다.
+    if isinstance(remaining_qty, bool) or not isinstance(remaining_qty, int):
+        raise TypeError(
+            f"remaining_qty must be int, not {type(remaining_qty).__name__}"
+        )
     if not 0 < remaining_qty <= state.fill_qty:
         raise ValueError(
             f"remaining_qty must be in (0, fill_qty]: "
