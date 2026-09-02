@@ -51,7 +51,7 @@ class StageState:
         return 0
 
     def __post_init__(self) -> None:
-        """주식 보유 상태는 체결가와 수량이 함께 있어야 한다.
+        """단계의 정체성 필드와 (보유 상태라면) 체결 필드의 불변식.
 
         이 검증은 두 계층으로 이루어진다:
         1. to_holding() 은 전이 문맥에서 유효성을 검사한다 (전이 실패 메시지)
@@ -59,12 +59,37 @@ class StageState:
         두 계층의 중복은 의도적이며, dataclasses.replace() 호출이 __init__을 거치므로
         모든 전이도 이 검증을 통과한다.
 
-        Plan 2에서 SQLite 행 재구성 시 부분 정보(예: fill_qty NULL)는 정확히
-        이 불변식을 위반한다. 따라서 경계에서의 보호가 필수다.
+        Plan 2에서 SQLite 행 재구성 시 부분 정보(예: fill_qty NULL)나 손상된
+        값(단계 0, 음수 발동가·수량)은 정확히 이 불변식을 위반한다. 손상된
+        발동가는 트리거 비교를, 손상된 수량은 금액 산술을 조용히 뒤집으므로
+        경계에서의 보호가 필수다.
         """
+        self._check_int_field("stage_no", self.stage_no, minimum=1,
+                              phrase="positive")
+        self._check_int_field("trigger_price", self.trigger_price, minimum=1,
+                              phrase="positive")
+        self._check_int_field("planned_qty", self.planned_qty, minimum=0,
+                              phrase="non-negative")
+        self._check_int_field("rebuy_count", self.rebuy_count, minimum=0,
+                              phrase="non-negative")
         if self.status in (StageStatus.HOLDING, StageStatus.SELL_PENDING):
             self._check_fill_field("fill_price", self.fill_price)
             self._check_fill_field("fill_qty", self.fill_qty)
+
+    @staticmethod
+    def _check_int_field(
+        name: str, value: object, *, minimum: int, phrase: str
+    ) -> None:
+        """정체성 필드 공통 검증: 타입 → 하한, 이 순서로.
+
+        타입 검사가 먼저인 이유는 `_check_fill_field` 와 같다 — float·bool·
+        Decimal 은 모두 크기 비교를 통과하므로, 타입을 확인하지 않으면 실수
+        발동가나 수량이 조용히 트리거 판정과 금액 산술로 흘러간다.
+        """
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be int, not {type(value).__name__}")
+        if value < minimum:
+            raise ValueError(f"{name} must be {phrase}: {value}")
 
     def _check_fill_field(self, name: str, value: int | None) -> None:
         """`fill_price`/`fill_qty` 공통 검증: 존재 → 타입 → 양수, 이 순서로.

@@ -49,32 +49,36 @@ class Cycle:
     closed_at: datetime | None = None
 
     def __post_init__(self) -> None:
-        # FINDING A: 상태별 필드 불변량 검사.
-        # RUNNING, PAUSED 상태는 앵커와 사다리가 반드시 필요하다.
-        # LIQUIDATING은 STARTING에서도 들어올 수 있으므로 (사용자 긴급 취소),
-        # 앵커가 있을 때만 검사한다.
-        if self.status in (CycleStatus.RUNNING, CycleStatus.PAUSED):
-            if self.anchor_price is None:
-                raise ValueError(
-                    f"Cycle status {self.status.value} requires anchor_price, got None"
-                )
-            if self.ladder is None:
-                raise ValueError(
-                    f"Cycle status {self.status.value} requires ladder, got None"
-                )
+        for name in ("cycle_id", "config_id", "seq"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be int, not {type(value).__name__}")
+            if value <= 0:
+                raise ValueError(f"{name} must be positive: {value}")
+
+        # RUNNING·PAUSED 는 앵커와 사다리가 반드시 있어야 한다. 트리거 판정을
+        # 하거나(RUNNING) 판정을 재개할 수 있는(PAUSED) 상태이므로 사다리 없이는
+        # 성립하지 않는다. LIQUIDATING 은 요구하지 않는다 — 긴급청산은 앵커가
+        # 생기기 전인 STARTING 에서도 시작할 수 있다(설계서 11.1절).
+        requires_ladder = self.status in (CycleStatus.RUNNING, CycleStatus.PAUSED)
+        if requires_ladder and self.anchor_price is None:
+            raise ValueError(
+                f"Cycle status {self.status.value} requires anchor_price, got None"
+            )
+        # 앵커가 있으면 사다리도 있어야 한다. 앵커는 사다리 확정과 같은 순간에
+        # 생기므로(confirm_anchor), 앵커만 있는 행은 어느 상태에서든 손상이다.
+        if self.ladder is None and (requires_ladder or self.anchor_price is not None):
+            raise ValueError(
+                f"Cycle status {self.status.value} requires ladder, got None"
+            )
+        # 두 값이 모두 있으면 반드시 같은 앵커를 가리켜야 한다 — 상태와
+        # 무관하다. 사다리는 앵커에서 전부 파생되므로 두 값이 다르면 어느 쪽이
+        # 진실인지 알 방법이 없다.
+        if self.anchor_price is not None and self.ladder is not None:
             if self.anchor_price != self.ladder.anchor_price:
                 raise ValueError(
-                    f"anchor_price {self.anchor_price} != ladder.anchor_price {self.ladder.anchor_price}"
-                )
-        elif self.status is CycleStatus.LIQUIDATING and self.anchor_price is not None:
-            # LIQUIDATING에 anchor_price가 있으면 ladder도 있어야 하고 일치해야 한다
-            if self.ladder is None:
-                raise ValueError(
-                    f"Cycle status LIQUIDATING with anchor_price requires ladder, got None"
-                )
-            if self.anchor_price != self.ladder.anchor_price:
-                raise ValueError(
-                    f"anchor_price {self.anchor_price} != ladder.anchor_price {self.ladder.anchor_price}"
+                    f"anchor_price {self.anchor_price} != "
+                    f"ladder.anchor_price {self.ladder.anchor_price}"
                 )
 
     @property

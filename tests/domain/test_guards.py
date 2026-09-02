@@ -152,6 +152,57 @@ def test_allows_total_limit_below_stock_limit():
     assert c.total_limit < c.stock_limit
 
 
+### 결정 타입(BuyStage·SellStage)의 불변식 — guards 의 직접 입력이다.
+
+
+@pytest.mark.parametrize("decision_type", [BuyStage, SellStage])
+@pytest.mark.parametrize("field_name", ["stage_no", "limit_price", "qty"])
+@pytest.mark.parametrize("bad_value", [0, -1, -100])
+def test_decision_rejects_nonpositive_fields(
+    decision_type: type, field_name: str, bad_value: int
+):
+    kwargs = {"stage_no": 2, "limit_price": 9_500, "qty": 105, "reason": "test"}
+    kwargs[field_name] = bad_value
+    with pytest.raises(ValueError, match=f"{field_name} must be positive"):
+        decision_type(**kwargs)
+
+
+@pytest.mark.parametrize("decision_type", [BuyStage, SellStage])
+@pytest.mark.parametrize("field_name", ["stage_no", "limit_price", "qty"])
+@pytest.mark.parametrize("bad_value", [9_500.0, True, Decimal(9_500)])
+def test_decision_rejects_non_int_fields(
+    decision_type: type, field_name: str, bad_value: object
+):
+    kwargs = {"stage_no": 2, "limit_price": 9_500, "qty": 105, "reason": "test"}
+    kwargs[field_name] = bad_value
+    with pytest.raises(TypeError, match=f"{field_name} must be int"):
+        decision_type(**kwargs)
+
+
+def test_rejects_bypass_via_negative_limit_price():
+    """음수 지정가는 총한도를 무력화한다 — 결정이 만들어지는 시점에 막는다.
+
+    ``limit_price=-100, qty=10`` 이면 예상 체결금액이 -1,000 이 되어
+    ``누적 + 예상 > 한도`` 가 언제나 거짓이 된다. 손절매가 없는 이 전략에서
+    총한도는 유일한 구조적 보호장치이므로, 이 값은 guards 에 닿기 전에
+    존재할 수 없어야 한다.
+    """
+    with pytest.raises(ValueError, match="limit_price must be positive"):
+        BuyStage(stage_no=2, limit_price=-100, qty=10, reason="cap bypass")
+
+
+def test_rejects_zero_limit_price_market_order_encoding():
+    """국내 증권사 API 에서 가격 0 은 시장가의 전선 표현이다.
+
+    설계서 8.2절의 "자동 트리거 경로는 시장가를 표현할 수 없다" 는 제약이
+    사슬 끝의 ``LimitOrderRequest`` 뿐 아니라 판정 경계에서도 성립해야 한다.
+    """
+    with pytest.raises(ValueError, match="limit_price must be positive"):
+        BuyStage(stage_no=2, limit_price=0, qty=105, reason="market order")
+    with pytest.raises(ValueError, match="limit_price must be positive"):
+        SellStage(stage_no=2, limit_price=0, qty=105, reason="market order")
+
+
 def test_rejects_bypass_via_float_inf_stock_limit():
     """The exact bypass scenario that would have allowed every buy."""
     with pytest.raises(TypeError, match="stock_limit must be int"):

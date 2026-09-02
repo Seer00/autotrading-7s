@@ -20,6 +20,25 @@ class LadderConfigError(ValueError):
     """사다리 설정이 실행 불가능할 때. 설정 등록 시점에 던진다."""
 
 
+def _require_int(name: str, value: object) -> None:
+    """금액·개수 필드는 원 단위 ``int`` 다 (설계서 3.1절).
+
+    ``bool`` 은 ``int`` 의 하위 클래스이므로 명시적으로 거절한다.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be int, not {type(value).__name__}")
+
+
+def _require_ratio(name: str, value: object) -> None:
+    """비율 필드는 ``Decimal`` 이다 (설계서 3.1절).
+
+    ``float`` 은 이 제약이 막으려던 바로 그 오차원이고, ``int`` 도 거절한다 —
+    "금액은 int, 비율은 Decimal" 이 흐려지면 두 종류가 조용히 섞인다.
+    """
+    if not isinstance(value, Decimal):
+        raise TypeError(f"{name} must be Decimal, not {type(value).__name__}")
+
+
 @dataclass(frozen=True, slots=True)
 class Ladder:
     """사이클 시작 시 1회 계산되어 사이클 종료까지 불변인 매수 계획."""
@@ -31,6 +50,19 @@ class Ladder:
     amount_per_stage: int
 
     def __post_init__(self) -> None:
+        # 타입 검사가 값 검사보다 먼저다. float 은 모든 크기 비교를 통과하므로
+        # 순서가 뒤바뀌면 float 금액이 비교를 지나 planned_qty → 주문 수량 →
+        # 총한도 산술까지 흘러간다. Plan 4 의 사다리 미리보기 대화상자가
+        # 사용자 입력으로 이 타입을 만들기 때문에 여기는 LimitOrderRequest 와
+        # 같은 성격의 외부 경계다. 타입 오류는 TypeError 로 낸다 —
+        # LadderConfigError 는 ValueError 하위라서, 값 오류를 잡으려는 호출자가
+        # 타입 오류를 함께 삼키면 안 된다.
+        _require_int("anchor_price", self.anchor_price)
+        _require_int("amount_per_stage", self.amount_per_stage)
+        _require_int("max_stages", self.max_stages)
+        _require_ratio("drop_pct", self.drop_pct)
+        _require_ratio("target_pct", self.target_pct)
+
         if not MIN_STAGES <= self.max_stages <= MAX_STAGES:
             raise LadderConfigError(
                 f"max_stages must be {MIN_STAGES}~{MAX_STAGES}: {self.max_stages}"
@@ -104,6 +136,8 @@ def target_price(fill_price: int, target_pct: Decimal) -> int:
 
     호가 단위 올림 — 내림하면 목표수익률에 미달한 채로 팔린다.
     """
+    _require_int("fill_price", fill_price)
+    _require_ratio("target_pct", target_pct)
     if fill_price <= 0:
         raise ValueError(f"fill_price must be positive: {fill_price}")
     raw = Decimal(fill_price) * (Decimal(1) + target_pct)

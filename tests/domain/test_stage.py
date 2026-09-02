@@ -132,6 +132,9 @@ def test_partial_buy_fill_confirms_with_filled_quantity_only():
         (StageStatus.SELL_PENDING, "to_sell_pending"),
         (StageStatus.SOLD, "to_sell_pending"),
         (StageStatus.SOLD, "cancel_buy"),
+        (StageStatus.WAITING, "cancel_sell"),
+        (StageStatus.HOLDING, "cancel_sell"),
+        (StageStatus.SOLD, "cancel_sell"),
     ],
 )
 def test_illegal_transitions_are_rejected(from_status: StageStatus, action: str):
@@ -144,6 +147,7 @@ def test_illegal_transitions_are_rejected(from_status: StageStatus, action: str)
         "to_holding": lambda s: to_holding(s, fill_price=1, fill_qty=1, at=T0),
         "to_sell_pending": lambda s: to_sell_pending(s),
         "cancel_buy": lambda s: cancel_buy(s),
+        "cancel_sell": lambda s: cancel_sell(s, remaining_qty=50),
     }[action]
     with pytest.raises(IllegalStageTransition):
         fn(st)
@@ -348,6 +352,67 @@ def test_cancel_sell_accepts_valid_int_remaining_qty():
     st = cancel_sell(to_sell_pending(holding()), remaining_qty=71)
     assert st.fill_qty == 71
     assert type(st.fill_qty) is int
+
+
+def _base_kwargs(**over) -> dict:
+    kwargs: dict = {
+        "stage_no": 2,
+        "status": StageStatus.WAITING,
+        "trigger_price": 9_500,
+        "planned_qty": 105,
+    }
+    kwargs.update(over)
+    return kwargs
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value", "message"),
+    [
+        ("stage_no", 0, "stage_no must be positive"),
+        ("stage_no", -1, "stage_no must be positive"),
+        ("trigger_price", 0, "trigger_price must be positive"),
+        ("trigger_price", -500, "trigger_price must be positive"),
+        ("planned_qty", -5, "planned_qty must be non-negative"),
+        ("rebuy_count", -3, "rebuy_count must be non-negative"),
+    ],
+)
+def test_rejects_out_of_range_identity_fields(field: str, bad_value: int, message: str):
+    """체결 필드만이 아니라 단계의 정체성 필드도 불변식을 갖는다.
+
+    Plan 2 가 SQLite 행에서 이 값들을 복원할 때 손상된 행(단계 0, 음수
+    발동가·수량)이 그대로 트리거 판정에 들어가면, 발동가 비교와 수량 산술이
+    조용히 뒤집힌다.
+    """
+    with pytest.raises(ValueError, match=message):
+        StageState(**_base_kwargs(**{field: bad_value}))
+
+
+@pytest.mark.parametrize(
+    "field", ["stage_no", "trigger_price", "planned_qty", "rebuy_count"]
+)
+@pytest.mark.parametrize("bad_value", [2.5, True, Decimal(2)])
+def test_rejects_non_int_identity_fields(field: str, bad_value: object):
+    """float·bool·Decimal 은 모두 크기 비교를 통과하므로 타입을 직접 검사한다."""
+    with pytest.raises(TypeError, match=f"{field} must be int"):
+        StageState(**_base_kwargs(**{field: bad_value}))
+
+
+def test_accepts_zero_planned_qty_and_first_stage():
+    """경계값은 유효하다 — 1단계, 계획수량 0, 재매수 0회."""
+    st = StageState(**_base_kwargs(stage_no=1, planned_qty=0, rebuy_count=0))
+    assert (st.stage_no, st.planned_qty, st.rebuy_count) == (1, 0, 0)
+
+
+def test_to_holding_rejects_nonpositive_fill_in_transition_context():
+    """전이 문맥의 검사는 전이 실패 메시지를 낸다 — `__post_init__` 이
+    최종 방어선이지만, 그 메시지는 호출자가 넘긴 인자를 가리키지 않는다."""
+    st = to_buy_pending(waiting())
+    with pytest.raises(ValueError, match=r"invalid fill: price=0 qty=105"):
+        to_holding(st, fill_price=0, fill_qty=105, at=T0)
+
+    st = to_buy_pending(waiting())
+    with pytest.raises(ValueError, match=r"invalid fill: price=9480 qty=0"):
+        to_holding(st, fill_price=9_480, fill_qty=0, at=T0)
 
 
 def test_non_holding_statuses_allow_no_fill():

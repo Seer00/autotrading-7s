@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -289,6 +290,49 @@ def test_target_pct_match_proceeds():
     decisions = decide(tick=tick(9_500), cycle=cycle, states=fresh_states(lad),
                        params=params, now=T0, market_open=True, stock_code="005930")
     assert len(decisions) == 1
+
+
+def test_stored_trigger_price_must_match_the_ladder():
+    """저장된 발동가가 사다리의 계산과 다르면 손상된 데이터다 — 판정하지 않는다.
+
+    설계서 4.2절은 이 숫자를 두 곳(`cycle.ladder_json`, `stage_state.
+    trigger_price`)에 쓴다. Plan 2 는 두 값을 묶어 두는 제약이 없는 컬럼에서
+    복원하므로, 손상된 발동가는 앵커보다 높은 가격에 매수하는 결정을 만들어
+    전략을 거꾸로 돌릴 수 있다.
+    """
+    lad = ladder()
+    states = fresh_states(lad)
+    states[1] = replace(states[1], trigger_price=999_999)
+
+    with pytest.raises(ValueError) as exc_info:
+        run(10_200, states)
+
+    msg = str(exc_info.value)
+    assert "stage 2" in msg, "어느 단계인지 밝혀야 한다"
+    assert "999999" in msg, "저장된 값을 밝혀야 한다"
+    assert "9500" in msg, "사다리가 계산한 값을 밝혀야 한다"
+
+
+def test_stored_trigger_price_mismatch_raises_instead_of_skipping():
+    """조용히 건너뛰면 손상이 숨는다 — 판정 대상이 없을 때도 예외가 나야 한다."""
+    lad = ladder()
+    states = fresh_states(lad)
+    states[1] = replace(states[1], trigger_price=1)  # 어떤 틱에서도 발동하지 않는 값
+
+    with pytest.raises(ValueError, match="trigger_price"):
+        run(10_000, states)
+
+
+def test_partial_states_list_stays_legal():
+    """일부 단계만 담긴 목록은 유효하다 — 없는 단계는 검사 대상이 아니다."""
+    lad = ladder()
+    states = [
+        StageState(stage_no=3, status=StageStatus.WAITING,
+                   trigger_price=lad.trigger_price(3),
+                   planned_qty=lad.planned_qty(3))
+    ]
+    decisions = run(9_000, states)
+    assert [d.stage_no for d in decisions] == [3]
 
 
 def test_starting_cycle_with_mismatched_target_pct_returns_empty():

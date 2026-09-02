@@ -37,12 +37,33 @@ class TriggerParams:
             raise ValueError(f"rebuy_cooldown_sec must be non-negative: {self.rebuy_cooldown_sec}")
 
 
+def _check_decision_fields(decision: BuyStage | SellStage) -> None:
+    """결정 타입의 공통 불변식 — 세 필드 모두 양의 ``int``.
+
+    ``BuyStage`` 와 ``SellStage`` 는 ``guards`` 의 직접 입력이고, guards 는 이
+    프로그램의 유일한 구조적 보호장치다. 음수 지정가는 예상 체결금액을 음수로
+    만들어 총한도 검사를 통째로 무력화하고, 가격 0 은 국내 증권사 API 에서
+    시장가의 전선 표현이다. 설계서 8.2절의 "자동 트리거 경로는 시장가를
+    표현할 수 없다" 는 제약이 사슬 끝의 ``LimitOrderRequest`` 뿐 아니라 판정
+    경계에서도 성립해야 한다.
+    """
+    for name in ("stage_no", "limit_price", "qty"):
+        value = getattr(decision, name)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be int, not {type(value).__name__}")
+        if value <= 0:
+            raise ValueError(f"{name} must be positive: {value}")
+
+
 @dataclass(frozen=True, slots=True)
 class BuyStage:
     stage_no: int
     limit_price: int
     qty: int
     reason: str
+
+    def __post_init__(self) -> None:
+        _check_decision_fields(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +72,9 @@ class SellStage:
     limit_price: int
     qty: int
     reason: str
+
+    def __post_init__(self) -> None:
+        _check_decision_fields(self)
 
 
 Decision = BuyStage | SellStage
@@ -118,9 +142,27 @@ def _eval_buy(
     by_no = {s.stage_no: s for s in states}
     for stage_no in range(1, ladder.max_stages + 1):
         state = by_no.get(stage_no)
+        # 목록에 없는 단계는 검사 대상이 아니다 — 일부 단계만 담긴 목록은
+        # 유효하다.
+        if state is None:
+            continue
+        # 검사 7: 저장된 발동가가 사다리의 계산과 일치하는지 확인한다.
+        #
+        # 설계서 4.2절은 이 숫자를 두 곳(cycle.ladder_json, stage_state.
+        # trigger_price)에 쓴다. 수량은 사다리에서 매번 다시 계산하지만
+        # 발동가는 단계 자신의 기록을 쓰므로, Plan 2 가 제약 없는 컬럼에서
+        # 복원한 손상된 값이 그대로 "살지 말지"를 결정한다. 앵커보다 높은
+        # 발동가는 하락 매수 전략을 거꾸로 돌린다. 조용히 건너뛰면 그 손상이
+        # 숨으므로 — decide() 가 중복 stage_no 에 그러듯 — 예외를 던진다.
+        expected = ladder.trigger_price(stage_no)
+        if state.trigger_price != expected:
+            raise ValueError(
+                f"trigger_price mismatch on stage {stage_no}: state has "
+                f"{state.trigger_price}, ladder computes {expected}"
+            )
         # 규칙 5 — WAITING 이 아닌 단계는 판정 대상이 아니다. PENDING 을
         # 제외하는 것이 중복 주문을 막는 방어선이다.
-        if state is None or state.status is not StageStatus.WAITING:
+        if state.status is not StageStatus.WAITING:
             continue
         # 규칙 3 — 재매수 쿨다운. last_sold_at 이 있으면 한 번 팔린 단계다.
         # 쿨다운이 없으면 같은 단계가 수수료를 태우며 분당 수십 번 회전한다.

@@ -309,6 +309,80 @@ def test_begin_liquidation_still_refuses_from_liquidating():
         begin_liquidation(cyc)
 
 
+@pytest.mark.parametrize("status", list(CycleStatus))
+def test_anchor_ladder_mismatch_is_rejected_in_every_status(status: CycleStatus):
+    """앵커와 사다리가 어긋난 사이클은 어떤 상태에서도 존재할 수 없다.
+
+    사다리는 앵커에서 전부 파생되므로, 두 값이 다르면 어느 쪽이 진실인지 알
+    방법이 없다. CLOSED·STARTING·IDLE 도 예외가 아니다 — Plan 2 가 그 행을
+    복원해 화면에 손익을 표시하고, 재시작 시 RUNNING 으로 되돌릴 수 있다.
+    """
+    with pytest.raises(ValueError, match="anchor_price .* != ladder.anchor_price"):
+        Cycle(cycle_id=1, config_id=1, seq=1, status=status,
+              anchor_price=9_000, ladder=ladder(anchor=10_000))
+
+
+@pytest.mark.parametrize("status", list(CycleStatus))
+def test_anchor_without_ladder_is_rejected_in_every_status(status: CycleStatus):
+    """앵커가 있으면 사다리도 있어야 한다 — 앵커는 사다리 확정과 함께 생긴다."""
+    with pytest.raises(ValueError, match="requires ladder"):
+        Cycle(cycle_id=1, config_id=1, seq=1, status=status, anchor_price=10_000)
+
+
+@pytest.mark.parametrize("status", list(CycleStatus))
+def test_matching_anchor_and_ladder_constructs_in_every_status(status: CycleStatus):
+    """일치하면 어떤 상태에서도 구성된다 — 검사는 불일치만 막는다."""
+    cyc = Cycle(cycle_id=1, config_id=1, seq=1, status=status,
+                anchor_price=10_000, ladder=ladder(anchor=10_000))
+    assert cyc.anchor_price == cyc.ladder.anchor_price  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("field", ["cycle_id", "config_id", "seq"])
+@pytest.mark.parametrize("bad_value", [1.5, "x", None, True, Decimal(1)])
+def test_rejects_non_int_identity_fields(field: str, bad_value: object):
+    """사이클의 정체성 필드는 int 다 — Plan 2 가 이 값으로 행을 찾는다."""
+    kwargs = {"cycle_id": 1, "config_id": 1, "seq": 1,
+              "status": CycleStatus.IDLE}
+    kwargs[field] = bad_value
+    with pytest.raises(TypeError, match=f"{field} must be int"):
+        Cycle(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field", ["cycle_id", "config_id", "seq"])
+@pytest.mark.parametrize("bad_value", [0, -1])
+def test_rejects_nonpositive_identity_fields(field: str, bad_value: int):
+    kwargs = {"cycle_id": 1, "config_id": 1, "seq": 1,
+              "status": CycleStatus.IDLE}
+    kwargs[field] = bad_value
+    with pytest.raises(ValueError, match=f"{field} must be positive"):
+        Cycle(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (CycleStatus.IDLE, False),
+        (CycleStatus.STARTING, True),
+        (CycleStatus.RUNNING, True),
+        (CycleStatus.PAUSED, False),
+        (CycleStatus.LIQUIDATING, False),
+        (CycleStatus.CLOSED, False),
+    ],
+)
+def test_is_active_only_for_starting_and_running(status: CycleStatus, expected: bool):
+    """진행 중 사이클은 STARTING·RUNNING 뿐이다 — 나머지는 활성이 아니다."""
+    cyc = Cycle(cycle_id=1, config_id=1, seq=1, status=status,
+                anchor_price=10_000, ladder=ladder())
+    assert cyc.is_active is expected
+
+
+def test_confirm_anchor_rejects_anchor_not_matching_ladder():
+    """앵커와 사다리를 함께 박제하는 지점에서 두 값의 일치를 확인한다."""
+    with pytest.raises(ValueError, match="anchor mismatch: 9340 != ladder 10000"):
+        confirm_anchor(start(idle(), at=T0), anchor_price=9_340,
+                       ladder=ladder(anchor=10_000), at=T0)
+
+
 def test_liquidating_to_paused_raises():
     """LIQUIDATING → PAUSED는 설계서 4.2절의 일방향 래칫을 보호하기 위해 거부된다.
     설계: PAUSED → RUNNING이 허용되므로, LIQUIDATING → PAUSED → RUNNING 경로는
