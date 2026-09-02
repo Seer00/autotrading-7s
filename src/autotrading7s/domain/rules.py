@@ -17,7 +17,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from autotrading7s.domain.cycle import Cycle
-from autotrading7s.domain.ladder import Ladder
+from autotrading7s.domain.ladder import Ladder, target_price
 from autotrading7s.domain.stage import StageState
 from autotrading7s.domain.types import StageStatus, Tick
 
@@ -96,6 +96,13 @@ def decide(
                         f"{cycle.ladder.target_pct}, "
                         f"params has {params.target_pct}")
 
+    # 규칙 1 — 매도를 먼저 평가한다. 매도가 하나라도 있으면 이 틱에서는
+    # 매도만 집행하고, 매수는 다음 틱에 평가한다. 매도 대금이 들어온 뒤
+    # 매수하도록 하려는 것이며, 틱 간격이 1초 미만이라 실질 지연은 없다.
+    sells = _eval_sells(tick, states, params)
+    if sells:
+        return list(sells)
+
     buy = _eval_buy(tick, cycle.ladder, states, params, now)
     return [buy] if buy is not None else []
 
@@ -132,6 +139,40 @@ def _eval_buy(
     return None
 
 
+def _eval_sells(
+    tick: Tick, states: Sequence[StageState], params: TriggerParams
+) -> list[SellStage]:
+    """목표가에 도달한 보유 단계 전부. 번호가 낮은 순.
+
+    매수와 달리 개수를 제한하지 않는다. 매도는 포지션을 줄이는 방향이므로
+    과다 집행 위험이 없고, 반등 구간에서 여러 단계가 동시에 목표에 닿는 것은
+    세븐스플릿의 의도된 동작이다.
+    """
+    out: list[SellStage] = []
+    for state in sorted(states, key=lambda s: s.stage_no):
+        # 규칙 5 — SELL_PENDING 은 이미 주문이 나갔다.
+        if state.status is not StageStatus.HOLDING:
+            continue
+        if state.fill_price is None or not state.fill_qty:
+            continue
+        target = target_price(state.fill_price, params.target_pct)
+        if tick.price < target:
+            continue
+        out.append(
+            SellStage(
+                stage_no=state.stage_no,
+                # 목표가로 지정가 발주한다. 지정가 매도는 시장의 최우선
+                # 매수호가에 체결되므로, 목표가로 걸어도 현재가가 더 높으면
+                # 더 좋은 가격에 체결된다. 목표 보장과 체결 확률을 동시에 얻는다.
+                limit_price=target,
+                qty=state.fill_qty,
+                reason=_sell_reason(state=state, tick=tick, target=target,
+                                    params=params),
+            )
+        )
+    return out
+
+
 def _pct(value: Decimal) -> str:
     return f"{(value * 100).normalize()}"
 
@@ -141,4 +182,14 @@ def _buy_reason(*, stage_no: int, tick: Tick, trigger: int, ladder: Ladder) -> s
         f"stage={stage_no} BUY | tick={tick.price}({tick.source.value}) "
         f"<= trigger={trigger} | anchor={ladder.anchor_price} "
         f"drop={_pct(ladder.drop_pct)}% stage_gap={stage_no - 1} | rule2_sequential"
+    )
+
+
+def _sell_reason(
+    *, state: StageState, tick: Tick, target: int, params: TriggerParams
+) -> str:
+    return (
+        f"stage={state.stage_no} SELL | tick={tick.price}({tick.source.value}) "
+        f">= target={target} | fill={state.fill_price} "
+        f"target_pct={_pct(params.target_pct)}% | rule1_sell_first"
     )
