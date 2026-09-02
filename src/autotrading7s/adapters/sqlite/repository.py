@@ -516,8 +516,13 @@ class SqliteRepository:
         `str` 로 남긴다 — 대응하는 도메인 enum 이 없다.
         """
         placeholders = ", ".join("?" for _ in self._PENDING_STATUSES)
+        # `LEFT JOIN` 인 이유: 긴급청산 주문은 `stage_state_id` 가 `None`
+        # 이므로 내부 조인이면 그 행이 사라진다 — 재시작 복구가 미체결 시장가
+        # 주문을 놓치게 된다.
         rows = self._conn.execute(
-            f"SELECT * FROM order_log WHERE status IN ({placeholders}) ORDER BY id",
+            "SELECT o.*, s.stage_no AS stage_no FROM order_log o "
+            "LEFT JOIN stage_state s ON s.id = o.stage_state_id "
+            f"WHERE o.status IN ({placeholders}) ORDER BY o.id",
             self._PENDING_STATUSES,
         ).fetchall()
         return [
@@ -535,6 +540,7 @@ class SqliteRepository:
                 fill_qty=r["fill_qty"],
                 status=r["status"],
                 sent_at=text_to_dt(r["sent_at"]),
+                stage_no=r["stage_no"],
             )
             for r in rows
         ]

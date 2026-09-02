@@ -178,6 +178,10 @@ class PendingOrderRow:
     fill_qty: int | None
     status: str
     sent_at: datetime
+    # 단계 번호. `stage_state_id` 만으로는 어느 단계인지 알 수 없고, 소비자
+    # (재시작 복구와 미체결 감시)가 전부 그것을 필요로 한다. 긴급청산 주문은
+    # 단계에 붙지 않으므로 `None` 이다.
+    stage_no: int | None = None
 
 
 @runtime_checkable
