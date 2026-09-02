@@ -21,6 +21,8 @@ RECONCILE_VERDICTS: frozenset[str] = frozenset(
 
 
 def _require_aware(at: datetime) -> None:
+    """같은 패키지의 `snapshot.py` 도 이것을 쓴다 — 같은 규칙을 두 번 쓰면
+    어긋난다. 밑줄로 시작하지만 `app` 안에서는 의도된 공유다."""
     if at.tzinfo is None or at.tzinfo.utcoffset(at) is None:
         raise ValueError(f"event timestamp must be tz-aware: {at!r}")
 
@@ -169,6 +171,48 @@ class GuardBlocked(Event):
     stage_no: int
     side: str
     reason: str
+    at: datetime
+
+    def __post_init__(self) -> None:
+        _require_aware(self.at)
+
+
+@dataclass(frozen=True, slots=True)
+class CommandFailed(Event):
+    """명령 하나가 예외로 실패했다 — 루프는 다음 명령으로 넘어갔다.
+
+    이 이벤트가 없으면 실패가 조용히 사라지거나(삼킴) 명령 소비 루프가 죽는다.
+    **후자가 더 나쁘다**: 설계서 7.1절이 `priority_q` 로 보장하려는 것은 "긴급
+    명령이 즉시 처리된다" 인데, 루프가 죽으면 그 뒤의 모든 긴급청산이 영구히
+    처리되지 않는다.
+    """
+
+    command: str
+    detail: str
+    at: datetime
+
+    def __post_init__(self) -> None:
+        _require_aware(self.at)
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigSaved(Event):
+    config_id: int
+    at: datetime
+
+    def __post_init__(self) -> None:
+        _require_aware(self.at)
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigRejected(Event):
+    """저장이 거부됐다. `detail` 은 도메인·리포지토리가 만든 문장을 그대로 담는다.
+
+    이 이벤트가 없으면 [저장]을 눌렀는데 아무 일도 일어나지 않는 화면이 된다.
+    """
+
+    config_id: int | None
+    detail: str
     at: datetime
 
     def __post_init__(self) -> None:

@@ -93,6 +93,60 @@ class SqliteRepository:
             if cursor.rowcount == 0:
                 raise RowNotFound(f"no split_config row with id={config_id}")
 
+    def update_config(self, config: SplitConfig, *, at: datetime) -> None:
+        """`IDLE` 설정의 값을 갱신한다 — 설계서 14.2절 [저장]의 수정 경로.
+
+        `ACTIVE` 를 거부하는 이유: 진행 중인 사이클의 사다리는
+        `cycle.ladder_json` 에 고정되어 있고 `load_stages` 의 H4 가
+        `trigger_price` 를 그 사다리와 대조한다. 설정을 바꾸면 그 대조가
+        실패해 **사이클이 로드 불가**가 된다 — 저장 한 번으로 복구 불가
+        상태를 만들 수 있으면 안 된다.
+
+        `status` 를 건드리지 않는 이유: 상태 전이는 `set_config_status` 의
+        몫이다. 두 경로가 같은 컬럼을 쓰면 어느 쪽이 최신인지 알 수 없다.
+        """
+        if config.config_id is None:
+            raise ValueError(
+                "update_config requires config_id; use save_config for a new row"
+            )
+        current = self._conn.execute(
+            "SELECT status, stock_code FROM split_config WHERE id = ?",
+            (config.config_id,),
+        ).fetchone()
+        if current is None:
+            raise RowNotFound(f"no split_config row with id={config.config_id}")
+        if dict(current)["status"] != "IDLE":
+            raise ValueError(
+                f"config {config.config_id} is {dict(current)['status']} — "
+                f"IDLE 설정만 수정할 수 있다 (진행 중인 사이클의 사다리와 "
+                f"어긋난다)"
+            )
+        if dict(current)["stock_code"] != config.stock_code:
+            # 설정은 특정 종목에 대한 계획이므로 종목을 바꾸는 것은 다른
+            # 설정이다. 더 중요하게는, `forced_close_baseline` 이 `cycle` 을
+            # `split_config.stock_code` 로 조인하므로 **강제 종료 대사 기준선이
+            # 조용히 다른 종목으로 옮겨간다** — 그러면 강제 종료한 적 없는
+            # 종목에서 실제 불일치가 상쇄되고 D13 자동 정지가 발동하지 않는다.
+            # 배경 보안 리뷰가 지적한 integrity-control-bypass 가 이것이다.
+            raise ValueError(
+                f"stock_code 는 바꿀 수 없다: "
+                f"{dict(current)['stock_code']} → {config.stock_code} "
+                f"(강제 종료 대사 기준선이 다른 종목으로 옮겨간다)"
+            )
+        # `config_to_row` 는 status·created_at·updated_at 을 모두 담는다.
+        # status 는 set_config_status 의 몫이고, created_at 은 최초 등록 시각
+        # 이므로 갱신하지 않으며, updated_at 은 인자 `at` 으로 덮는다.
+        row = config_to_row(config)
+        for key in ("status", "created_at", "updated_at"):
+            row.pop(key, None)
+        assignments = ", ".join(f"{k} = :{k}" for k in row)
+        with self._conn:
+            self._conn.execute(
+                f"UPDATE split_config SET {assignments}, updated_at = :updated "
+                "WHERE id = :id",
+                row | {"id": config.config_id, "updated": dt_to_text(at)},
+            )
+
     # ── 사이클 ──────────────────────────────────────────────────────────
     def create_cycle(self, config_id: int, started_at: datetime) -> Cycle:
         with self._conn:

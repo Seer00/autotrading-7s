@@ -29,6 +29,9 @@ from datetime import timedelta
 
 from autotrading7s.app import commands as cmd
 from autotrading7s.app.events import (
+    CommandFailed,
+    ConfigRejected,
+    ConfigSaved,
     CycleClosed,
     CycleLoadFailed,
     EngineStopped,
@@ -38,6 +41,7 @@ from autotrading7s.app.events import (
     TickUpdate,
 )
 from autotrading7s.app.settings import EngineSettings
+from autotrading7s.app.snapshot import ConfigSnapshot, Snapshot
 from autotrading7s.domain import cycle as cycle_mod
 from autotrading7s.domain.cycle import Cycle
 from autotrading7s.domain.errors import DomainInvariantError
@@ -92,6 +96,7 @@ class Orchestrator:
         self._reconciler = Reconciler(repo=repo, broker=broker, clock=clock,
                                       emit=self._emit)
         self._last_reconcile: object = None
+        self._last_snapshot_core: tuple[object, ...] | None = None
         self.stopped = False
 
     def _emit(self, event: Event) -> None:
@@ -100,13 +105,41 @@ class Orchestrator:
     # ── 명령 소비 ───────────────────────────────────────────────────────
     async def drain_commands(self) -> None:
         """`priority_q` 를 먼저 완전히 비우고, 그 다음 `command_q` 를 본다."""
+        handled = False
         for q in (self._priority_q, self._command_q):
             while True:
                 try:
                     command = q.get_nowait()
                 except queue.Empty:
                     break
-                await self._handle(command)
+                await self._safe_handle(command)
+                handled = True
+        if handled:
+            # [시작]을 눌렀는데 화면이 그대로면 사용자는 눌렸는지 알 수 없다.
+            self.emit_snapshot_if_changed()
+
+    async def _safe_handle(self, command: cmd.Command) -> None:
+        """명령 **하나 단위로** 예외를 격리한다.
+
+        여기서 예외가 빠져나가면 `drain_commands` → `run()` 을 거쳐 엔진
+        스레드가 죽고, **그 시점부터 모든 명령이 영구히 처리되지 않는다** —
+        설계서 7.1절이 `priority_q` 로 보장하려는 "긴급 명령의 즉시성" 이
+        앞선 일반 명령 하나의 실패로 무너진다. 배경 보안 리뷰가 지적한
+        `unhandled-exception-kills-priority-command-loop` 가 이것이다.
+
+        **삼키는 것이 아니다.** 잡은 예외는 `CommandFailed` 로 화면에 나가고
+        루프는 다음 명령으로 넘어간다. 이것이 이 코드베이스에서 넓은 `except`
+        가 옳은 유일한 자리이며, 그 이유는 대안(루프 사망)이 더 나쁘다는 것
+        하나다.
+        """
+        try:
+            await self._handle(command)
+        except Exception as exc:                          # noqa: BLE001
+            self._emit(CommandFailed(
+                command=type(command).__name__,
+                detail=f"{type(exc).__name__}: {exc}",
+                at=self._clock.now(),
+            ))
 
     async def _handle(self, command: cmd.Command) -> None:
         if isinstance(command, cmd.EmergencyLiquidate):
@@ -130,6 +163,8 @@ class Orchestrator:
             # D5 — 정지는 자동 트리거를 멈추는 것이고 사이클 종료가 아니다.
             self._transition(command.config_id, cycle_mod.pause,
                              allowed_from=(CycleStatus.RUNNING,))
+        elif isinstance(command, cmd.SaveConfig):
+            self._save_config(command)
         elif isinstance(command, cmd.ResetReconcileBaseline):
             self._reconciler.reset_baseline(command.stock_code)
         elif isinstance(command, cmd.Shutdown):
@@ -166,6 +201,72 @@ class Orchestrator:
         for cyc in self._repo.load_active_cycles():
             if cyc.config_id == config_id and cyc.status in allowed_from:
                 self._repo.save_cycle(fn(cyc))
+
+    def _save_config(self, command: cmd.SaveConfig) -> None:
+        """설계서 14.2절 [저장]. 거부를 반드시 이벤트로 되돌린다 —
+        그러지 않으면 눌렀는데 아무 일도 일어나지 않는 화면이 된다.
+
+        `SplitConfig` 는 검증하지 않는 순수 DTO 이고 모든 불변식이 `Ladder` 에
+        있으므로, `to_ladder` 가 저장 전에 친절한 메시지를 주는 유일한 방법이다.
+        **다만 그 임시 앵커에서는 "1단계에서 1주도 못 산다" 규칙이 결코 발동하지
+        않는다** (`amount // amount == 1`) — 그 규칙은 실제 앵커에 달렸고 저장
+        시점에는 알 수 없다. 미리보기가 사용자가 입력한 현재가로 그것을 보여주는
+        것이 그 규칙의 실제 방어선이다.
+
+        `Ladder` 가 보지 않는 두 값(`rebuy_cooldown_sec`·`total_limit`)은
+        여기서 직접 검사한다. 그러지 않으면 스키마 CHECK 가 `IntegrityError` 로
+        거부하고, 그 예외는 포트 계약에 없어서 사용자에게 이유가 전달되지 않는다.
+        """
+        at = self._clock.now()
+        try:
+            if command.rebuy_cooldown_sec < 0:
+                raise ValueError(
+                    f"rebuy_cooldown_sec must be non-negative: "
+                    f"{command.rebuy_cooldown_sec}"
+                )
+            if command.total_limit < 0:
+                raise ValueError(
+                    f"total_limit must be non-negative: {command.total_limit}"
+                )
+            # 스키마의 UNIQUE(stock_code, label) 가 최종 방어선이지만 그
+            # IntegrityError 는 사용자에게 "같은 이름의 설정이 이미 있다" 를
+            # 말해주지 않는다.
+            for other in self._repo.list_configs():
+                if (other.config_id != command.config_id
+                        and other.stock_code == command.stock_code
+                        and other.label == command.label):
+                    raise ValueError(
+                        f"{command.stock_code} 에 이미 "
+                        f"{command.label!r} 이름의 설정이 있습니다 "
+                        f"(config_id={other.config_id})"
+                    )
+            config = SplitConfig(
+                config_id=command.config_id, stock_code=command.stock_code,
+                stock_name=command.stock_name, label=command.label,
+                max_stages=command.max_stages, drop_pct=command.drop_pct,
+                target_pct=command.target_pct,
+                amount_per_stage=command.amount_per_stage,
+                allow_rebuy=command.allow_rebuy,
+                rebuy_cooldown_sec=command.rebuy_cooldown_sec,
+                total_limit=command.total_limit,
+                # 신규는 IDLE 로 시작하고, 수정은 update_config 가 status 를
+                # 아예 건드리지 않는다 — 상태 전이는 set_config_status 의 몫이다.
+                status="IDLE",
+                created_at=at, updated_at=at,
+            )
+            # 단계 수·비율 범위·금액 양수를 여기서 잡는다. 스키마 CHECK 와 같은
+            # 범위이지만 이쪽이 사용자에게 읽히는 문장을 낸다.
+            config.to_ladder(anchor_price=command.amount_per_stage)
+            if command.config_id is None:
+                config_id = self._repo.save_config(config)
+            else:
+                self._repo.update_config(config, at=at)
+                config_id = command.config_id
+        except (ValueError, TypeError) as exc:
+            self._emit(ConfigRejected(config_id=command.config_id,
+                                      detail=str(exc), at=at))
+            return
+        self._emit(ConfigSaved(config_id=config_id, at=at))
 
     def _isolate(self, cyc: Cycle) -> str | None:
         """데이터 문제가 있는 사이클을 격리한다 — 사이클을 PAUSED 로.
@@ -271,6 +372,73 @@ class Orchestrator:
         self._repo.save_cycle(cycle_mod.confirm_anchor(
             cyc, anchor_price=tick.price, ladder=ladder, at=tick.at))
 
+    # ── 스냅샷 ──────────────────────────────────────────────────────────
+    def build_snapshot(self) -> Snapshot:
+        """설계서 14.1절의 표를 그릴 수 있는 상태를 모은다.
+
+        `holdings()` 뷰를 쓰지 않는 이유: 그 뷰는 보유 단계로 조인하므로
+        보유 0 인 설정이 행을 만들지 못하고(목업의 `NAVER 0/5 IDLE`)
+        `config_id` 도 없어서 명령 대상을 알 수 없다.
+        """
+        by_config = {c.config_id: c for c in self._repo.load_active_cycles()}
+        pending: dict[int, int] = {}
+        for row in self._repo.load_pending_orders():
+            pending[row.cycle_id] = pending.get(row.cycle_id, 0) + 1
+
+        configs: list[ConfigSnapshot] = []
+        for config in self._repo.list_configs():
+            cyc = by_config.get(config.config_id)
+            stages: tuple[StageState, ...] = ()
+            if cyc is not None:
+                try:
+                    stages = tuple(self._repo.load_stages(cyc.cycle_id))
+                except CorruptRowError:
+                    # 손상된 사이클도 담는다 — 표에서 사라지면 사용자는 그것이
+                    # 존재하는지조차 모른다. 2A 핸드오버 7 이 요구한 "사용자에게
+                    # 나갈 길" 의 최소 조건은 그 설정이 화면에 보이는 것이다.
+                    # 실패의 내용은 CycleLoadFailed 이벤트가 전달한다.
+                    stages = ()
+            configs.append(ConfigSnapshot(
+                config_id=config.config_id,
+                stock_code=config.stock_code,
+                stock_name=config.stock_name,
+                label=config.label,
+                config_status=config.status,
+                max_stages=config.max_stages,
+                drop_pct=config.drop_pct,
+                target_pct=config.target_pct,
+                amount_per_stage=config.amount_per_stage,
+                allow_rebuy=config.allow_rebuy,
+                rebuy_cooldown_sec=config.rebuy_cooldown_sec,
+                stock_limit=config.total_limit,
+                cycle_id=None if cyc is None else cyc.cycle_id,
+                cycle_seq=None if cyc is None else cyc.seq,
+                cycle_status=None if cyc is None else cyc.status,
+                anchor_price=None if cyc is None else cyc.anchor_price,
+                ladder=None if cyc is None else cyc.ladder,
+                cycle_started_at=None if cyc is None else cyc.started_at,
+                stages=stages,
+                pending_orders=(0 if cyc is None
+                                else pending.get(cyc.cycle_id, 0)),
+            ))
+        return Snapshot(configs=tuple(configs),
+                        total_limit=self._settings.total_limit,
+                        at=self._clock.now())
+
+    def emit_snapshot_if_changed(self) -> bool:
+        """상태가 변했을 때만 발행한다. 발행했으면 True.
+
+        `Snapshot.core` 가 `at` 을 제외하므로 유휴 틱에서는 아무것도 나가지
+        않는다. 시간 주기로 거르는 대안은 `FakeClock` 이 멈춘 테스트에서 첫
+        스냅샷만 나가게 만들어 그 경로를 검증할 수 없게 한다.
+        """
+        snap = self.build_snapshot()
+        if snap.core == self._last_snapshot_core:
+            return False
+        self._last_snapshot_core = snap.core
+        self._emit(snap)
+        return True
+
     # ── 미체결 감시 ─────────────────────────────────────────────────────
     async def poll_pending(self) -> None:
         """DB 를 진실로 삼는다 — 메모리 캐시를 두면 재시작 복구와 두 개의
@@ -343,6 +511,9 @@ class Orchestrator:
         `asyncio.create_task` 로 분리하는 것이 다음 단계다.
         """
         await self.drain_commands()
+        # GUI 는 기동 직후 화면을 그려야 한다 — 첫 틱을 기다릴 수 없고, 활성
+        # 사이클이 없으면 아래 루프가 바로 반환하므로 여기서 내야 한다.
+        self.emit_snapshot_if_changed()
         rounds = 0
         while not self.stopped:
             codes = self._subscribed_codes()
@@ -375,6 +546,7 @@ class Orchestrator:
         await self.poll_pending()
         if self._due_for_reconcile(tick):
             await self.reconcile()
+        self.emit_snapshot_if_changed()
 
     async def _fallback(self, codes: list[str]) -> None:
         """설계서 8.4절 — REST 폴백. **트리거 판정은 계속 수행한다.**

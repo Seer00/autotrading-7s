@@ -213,6 +213,20 @@ class RepositoryPort(Protocol):
         """
         ...
 
+    def update_config(self, config: SplitConfig, *, at: datetime) -> None:
+        """`IDLE` 설정의 값을 갱신한다. `status` 는 갱신하지 않는다.
+
+        `ACTIVE` 설정을 거부하는 이유: 진행 중인 사이클의 사다리는
+        `cycle.ladder_json` 에 고정되어 있고 `load_stages` 의 H4 가
+        `trigger_price` 를 그 사다리와 대조한다. 설정을 바꾸면 그 대조가
+        실패해 **사이클이 로드 불가**가 된다 — 저장 한 번으로 복구 불가
+        상태를 만들 수 있으면 안 된다.
+
+        `status` 를 건드리지 않는 이유: 상태 전이는 `set_config_status` 의
+        몫이다. 두 경로가 같은 컬럼을 쓰면 어느 쪽이 최신인지 알 수 없다.
+        """
+        ...
+
     # ── 사이클과 단계 ───────────────────────────────────────────────────
     def create_cycle(self, config_id: int, started_at: datetime) -> Cycle:
         """seq 를 자동 증가시켜 STARTING 사이클을 만든다."""

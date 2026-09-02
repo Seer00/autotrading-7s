@@ -13,6 +13,7 @@ GUI 와 엔진은 메시지로만 대화한다. 이 경계 덕분에 향후 프�
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 
 _EMERGENCY_SCOPES = frozenset({"SINGLE", "ALL"})
 FORCE_CLOSE_CONFIRMATION = "강제종료"
@@ -112,6 +113,49 @@ class ForceClose(PriorityCommand):
             raise ValueError(
                 f"confirmed_text must be {FORCE_CLOSE_CONFIRMATION!r} (설계서 11.4절)"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class SaveConfig(Command):
+    """분할 설정 등록·수정 — 설계서 14.2절.
+
+    `config_id` 가 `None` 이면 신규, 정수면 수정이다. **수정은 `IDLE` 설정만
+    가능하다** — `ACTIVE` 설정의 값을 바꾸면 진행 중인 사이클의 사다리
+    (`cycle.ladder_json` 에 고정)와 어긋나고 `load_stages` 의 H4 가 그 사이클을
+    로드 불가로 만든다.
+
+    값은 이미 타입이 맞아야 한다. 문자열 → `Decimal` 파싱은 뷰모델의 몫이며
+    (`ui/view_model.parse_config_form`), 그래야 파싱 실패가 입력 위젯 옆에
+    보인다 — 엔진 스레드에서 일어나면 그 메시지는 로그에만 남는다.
+    """
+
+    config_id: int | None
+    stock_code: str
+    stock_name: str | None
+    label: str | None
+    max_stages: int
+    drop_pct: Decimal
+    target_pct: Decimal
+    amount_per_stage: int
+    allow_rebuy: bool
+    rebuy_cooldown_sec: int
+    total_limit: int
+
+    def __post_init__(self) -> None:
+        for name in ("drop_pct", "target_pct"):
+            value = getattr(self, name)
+            if not isinstance(value, Decimal):
+                raise TypeError(
+                    f"{name} must be Decimal, not {type(value).__name__} — "
+                    f"문자열 파싱은 뷰모델의 몫이다"
+                )
+        for name in ("max_stages", "amount_per_stage", "rebuy_cooldown_sec",
+                     "total_limit"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(
+                    f"{name} must be int, not {type(value).__name__}"
+                )
 
 
 PRIORITY_COMMANDS: frozenset[type[Command]] = frozenset(

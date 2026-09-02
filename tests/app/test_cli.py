@@ -51,3 +51,59 @@ def test_simulate_runs_headless_and_exits_zero(tmp_path):
 def test_settings_are_required(tmp_path):
     with pytest.raises(SystemExit):
         cli.main(["--env", "mock"])
+
+
+def _seeded_db(tmp_path):
+    """IDLE 설정 하나가 있는 DB — 표에 행이 하나 나오게 만든다."""
+    from datetime import UTC, datetime
+    from decimal import Decimal
+
+    from autotrading7s.adapters.sqlite.migrations import apply_schema, connect
+    from autotrading7s.adapters.sqlite.repository import SqliteRepository
+    from autotrading7s.ports.repository import SplitConfig
+
+    at = datetime(2026, 9, 2, 9, 30, tzinfo=UTC)
+    pct = Decimal("0.05")
+    db = tmp_path / "cli.db"
+    conn = connect(db)
+    apply_schema(conn)
+    SqliteRepository(conn).save_config(SplitConfig(
+        config_id=None, stock_code="005930", stock_name="삼성전자",
+        label="기본", max_stages=7, drop_pct=pct, target_pct=pct,
+        amount_per_stage=1_000_000, allow_rebuy=False, rebuy_cooldown_sec=60,
+        total_limit=7_000_000, status="IDLE", created_at=at, updated_at=at))
+    conn.close()
+    return db
+
+
+def test_status_mode_prints_the_holdings_table(tmp_path, capsys):
+    """프레젠터 사슬 전체가 EC2 에서 end-to-end 로 돈다 —
+    스냅샷 발행 → 프레젠터 소비 → 뷰모델 → 렌더러.
+
+    그 사슬이 Windows 에서 처음 돌면 어디가 틀렸는지 알기 어렵다.
+    """
+    settings = tmp_path / "settings.toml"
+    settings.write_text("[engine]\ntotal_limit = 100000000\n",
+                        encoding="utf-8")
+    db = _seeded_db(tmp_path)
+    code = cli.main(["--env", "mock", "--settings", str(settings),
+                     "--db", str(db), "--simulate", "10000,9500", "--status"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "보유현황" in out
+    assert "삼성전자" in out and "005930" in out
+    assert "합계" in out
+    assert "총한도" in out
+    assert "증권사" in out
+
+
+def test_status_mode_is_off_by_default(tmp_path, capsys):
+    """`--status` 없이는 조용히 돈다 — 상시 가동 프로세스가 로그를 채우면 안 된다."""
+    settings = tmp_path / "settings.toml"
+    settings.write_text("[engine]\ntotal_limit = 100000000\n",
+                        encoding="utf-8")
+    db = _seeded_db(tmp_path)
+    code = cli.main(["--env", "mock", "--settings", str(settings),
+                     "--db", str(db), "--simulate", "10000,9500"])
+    assert code == 0
+    assert "보유현황" not in capsys.readouterr().out

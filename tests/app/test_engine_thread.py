@@ -42,11 +42,17 @@ class _Orchestrator:
 
 
 class _Recovery:
-    def __init__(self):
+    """복구는 `event_q` 를 받아야 한다 — 기동 직후가 CycleLoadFailed·
+    ReconcileMismatch 가 가장 나올 만한 시점이다."""
+
+    def __init__(self, *, event_q=None):
         self.ran = False
+        self.event_q = event_q
 
     async def run(self):
         self.ran = True
+        if self.event_q is not None:
+            self.event_q.put(EngineStopped(detail="복구 완료(테스트)", at=AT))
 
 
 def test_send_priority_rejects_a_plain_command():
@@ -56,7 +62,7 @@ def test_send_priority_rejects_a_plain_command():
     """
     thread = EngineThread(
         orchestrator_factory=lambda **kw: _Orchestrator(**kw),
-        recovery_factory=_Recovery,
+        recovery_factory=lambda **kw: _Recovery(**kw),
     )
     with pytest.raises(TypeError, match="PriorityCommand"):
         thread.send_priority(PauseCycle(config_id=1))
@@ -78,7 +84,7 @@ def test_recovery_runs_before_the_orchestrator():
         orch_box.append(orch)
         return orch
 
-    def make_recovery():
+    def make_recovery(**kw):
         order.append("recovery")
         return recovery
 
@@ -102,7 +108,7 @@ def test_commands_reach_the_engine_and_events_come_back():
         return orch
 
     thread = EngineThread(orchestrator_factory=make_orch,
-                          recovery_factory=_Recovery)
+                          recovery_factory=lambda **kw: _Recovery(**kw))
     thread.send(StartCycle(config_id=3))
     thread.send(Shutdown())
     thread.start()
@@ -117,7 +123,7 @@ def test_commands_reach_the_engine_and_events_come_back():
 def test_stop_joins_the_thread():
     thread = EngineThread(
         orchestrator_factory=lambda **kw: _Orchestrator(**kw),
-        recovery_factory=_Recovery,
+        recovery_factory=lambda **kw: _Recovery(**kw),
     )
     thread.send(Shutdown())
     thread.start()
@@ -133,12 +139,15 @@ def test_a_crashed_engine_is_not_silent():
     확인할 수 있게 한다.
     """
     class _Boom:
+        def __init__(self, **kw):
+            pass
+
         async def run(self):
             raise RuntimeError("복구 실패")
 
     thread = EngineThread(
         orchestrator_factory=lambda **kw: _Orchestrator(**kw),
-        recovery_factory=_Boom,
+        recovery_factory=lambda **kw: _Boom(**kw),
     )
     thread.start()
     thread.stop()
@@ -146,3 +155,23 @@ def test_a_crashed_engine_is_not_silent():
     assert thread.is_alive() is False
     with pytest.raises(RuntimeError, match="복구 실패"):
         thread.raise_if_failed()
+
+
+def test_recovery_events_reach_the_gui():
+    """복구가 낸 이벤트가 `drain_events()` 에 나타나야 한다.
+
+    이것이 `recovery_factory(event_q=...)` 변경의 요점이다 — 넘기지 않으면
+    기동 직후의 CycleLoadFailed·ReconcileMismatch 가 화면에 도달하지 않고,
+    그 두 이벤트가 가장 나올 만한 시점이 정확히 기동 직후다.
+    """
+    thread = EngineThread(
+        orchestrator_factory=lambda **kw: _Orchestrator(**kw),
+        recovery_factory=lambda **kw: _Recovery(**kw),
+    )
+    thread.send(Shutdown())
+    thread.start()
+    thread.stop()
+    thread.raise_if_failed()
+
+    kinds = [type(e).__name__ for e in thread.drain_events()]
+    assert "EngineStopped" in kinds

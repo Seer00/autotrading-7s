@@ -23,8 +23,11 @@ from pathlib import Path
 from autotrading7s.adapters.sqlite.migrations import apply_schema, connect
 from autotrading7s.adapters.sqlite.repository import SqliteRepository
 from autotrading7s.app.settings import load_settings
+from autotrading7s.app.snapshot import Snapshot
 from autotrading7s.engine.orchestrator import Orchestrator
 from autotrading7s.engine.recovery import Recovery
+from autotrading7s.ui.presenter import Presenter
+from autotrading7s.ui.text_render import render_holdings, render_status_bar
 
 _DB_PATHS = {
     "mock": Path("data/mock/autotrading7s.db"),
@@ -51,6 +54,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--simulate", default=None,
                         help="쉼표로 구분한 가격 스크립트. 시뮬레이션 "
                              "브로커로 기동한다.")
+    parser.add_argument("--status", action="store_true",
+                        help="스냅샷마다 보유현황 표를 표준출력에 찍는다 "
+                             "(설계서 14.1절의 텍스트 재현).")
     return parser
 
 
@@ -81,14 +87,49 @@ def main(argv: list[str] | None = None) -> int:
     clock = FakeClock(current=datetime.now(UTC))
     event_q: queue.Queue = queue.Queue()
 
+    # 프레젠터 사슬 전체를 여기서 돌린다 — 스냅샷 발행 → 프레젠터 소비 →
+    # 뷰모델 → 렌더러. 그 사슬이 Windows 에서 처음 돌면 어디가 틀렸는지 알기
+    # 어렵다.
+    presenter = Presenter(args.env)
+
     async def run() -> None:
+        stop = asyncio.Event()
+
+        async def drain() -> None:
+            """이벤트를 프레젠터에 먹이고 스냅샷마다 화면을 찍는다.
+
+            `asyncio.sleep(0)` 은 양보만 하므로 실제로 잠들지 않는다 — 이
+            파일은 조립 층이므로 오케스트레이터의 "주입된 sleep" 규칙이
+            적용되지 않는다.
+            """
+            while True:
+                drew = False
+                while True:
+                    try:
+                        event = event_q.get_nowait()
+                    except queue.Empty:
+                        break
+                    presenter.consume(event)
+                    drew = drew or isinstance(event, Snapshot)
+                if drew and args.status:
+                    print(render_holdings(presenter.holdings()))
+                    print(render_status_bar(presenter.status_bar()))
+                if stop.is_set():
+                    return
+                await asyncio.sleep(0)
+
         await Recovery(repo=repo, broker=broker, clock=clock,
                        emit=event_q.put).run()
-        await Orchestrator(
-            repo=repo, broker=broker, clock=clock, settings=settings,
-            command_q=queue.Queue(), priority_q=queue.Queue(),
-            event_q=event_q, max_fallback_rounds=3,
-        ).run()
+        drainer = asyncio.create_task(drain())
+        try:
+            await Orchestrator(
+                repo=repo, broker=broker, clock=clock, settings=settings,
+                command_q=queue.Queue(), priority_q=queue.Queue(),
+                event_q=event_q, max_fallback_rounds=3,
+            ).run()
+        finally:
+            stop.set()
+            await drainer
 
     asyncio.run(run())
     return 0

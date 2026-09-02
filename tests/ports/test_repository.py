@@ -36,6 +36,7 @@ def test_repository_port_declares_the_expected_methods():
     expected = {
         # 설정
         "save_config", "load_config", "list_configs", "set_config_status",
+        "update_config",
         # 사이클과 단계
         "create_cycle", "load_cycle", "save_cycle", "load_stages", "save_stage",
         "load_active_cycles", "stage_row_id", "emergency_close_cycle",
