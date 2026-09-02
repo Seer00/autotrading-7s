@@ -20,6 +20,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
+from autotrading7s.app.commands import (
+    FORCE_CLOSE_CONFIRMATION,
+    LIQUIDATE_ALL_CONFIRMATION,
+)
+from autotrading7s.app.events import ReconcileMismatch
 from autotrading7s.app.snapshot import ConfigSnapshot, Snapshot
 from autotrading7s.domain import pnl
 from autotrading7s.domain.ladder import Ladder, target_price
@@ -370,3 +375,153 @@ def parse_config_form(fields: Mapping[str, str]) -> dict[str, object]:
         out[name] = percent / 100
     out["allow_rebuy"] = (fields.get("allow_rebuy") or "").strip() in _TRUTHY
     return out
+
+
+# ── 다이얼로그·상태바·배너 (설계서 14.1·14.3·11.4절) ────────────────────
+_ENV_LABELS = {"mock": "▣ 모의투자", "real": "▣ 실전투자"}
+
+
+@dataclass(frozen=True, slots=True)
+class EmergencyDialogView:
+    config_id: int
+    stock_code: str
+    stock_name: str | None
+    held_qty: int
+    holding_stages: int
+    current_price: int | None
+    estimated_amount: int | None
+    avg_price: int | None
+    estimated_pnl: int | None
+    estimated_pnl_pct: Decimal | None
+    pending_orders: int
+    required_text: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ForceCloseDialogView:
+    config_id: int
+    stock_code: str
+    stock_name: str | None
+    remaining_qty: int
+    holding_stages: int
+    attempts: int
+    last_attempt_at: datetime | None
+    last_failure_detail: str | None
+    required_text: str = FORCE_CLOSE_CONFIRMATION
+
+
+@dataclass(frozen=True, slots=True)
+class StatusBarView:
+    quote_source_label: str
+    last_reconcile_label: str
+    total_used: int
+    total_limit: int
+    used_pct: Decimal | None
+
+
+@dataclass(frozen=True, slots=True)
+class BannerView:
+    env_label: str
+    is_real: bool
+    connection_label: str
+    engine_error: str | None
+
+
+def build_emergency_view(
+    config: ConfigSnapshot, *, current_price: int | None, scope: str,
+) -> EmergencyDialogView:
+    """설계서 14.3절 재확인 다이얼로그.
+
+    팔 것이 없는 종목에 이 다이얼로그를 띄우면 사용자를 오도하므로 거부한다.
+    현재가를 모르면 예상금액을 추측하지 않는다 — 사용자가 그 숫자를 근거로
+    실행 여부를 판단한다.
+
+    `required_text` 를 여기서 정하는 이유: 다이얼로그가 직접 쓰면 상수와
+    어긋날 수 있고, 어긋나면 사용자가 정확히 입력했는데 버튼이 활성화되지
+    않는다.
+    """
+    held = pnl.held_qty(config.stages)
+    if held == 0:
+        raise ValueError(
+            f"{config.stock_code}: 보유 수량이 0 이므로 긴급청산할 것이 없다"
+        )
+    return EmergencyDialogView(
+        config_id=config.config_id, stock_code=config.stock_code,
+        stock_name=config.stock_name, held_qty=held,
+        holding_stages=pnl.holding_stage_count(config.stages),
+        current_price=current_price,
+        estimated_amount=None if current_price is None else held * current_price,
+        avg_price=pnl.avg_price(config.stages),
+        estimated_pnl=(None if current_price is None
+                       else pnl.unrealized_pnl(config.stages, current_price)),
+        estimated_pnl_pct=(None if current_price is None else
+                           pnl.unrealized_pnl_pct(config.stages,
+                                                  current_price)),
+        pending_orders=config.pending_orders,
+        required_text=(LIQUIDATE_ALL_CONFIRMATION if scope == "ALL" else None),
+    )
+
+
+def build_force_close_view(
+    config: ConfigSnapshot, *, attempts: int,
+    last_attempt_at: datetime | None, last_failure_detail: str | None,
+) -> ForceCloseDialogView:
+    """설계서 11.4절 강제 종료 확인.
+
+    잔량 0 의 강제 종료는 의미가 없다(절차 ③) — 엔진도 그것을 정상 종료로
+    처리하므로 다이얼로그가 애초에 뜨면 안 된다.
+    """
+    remaining = pnl.held_qty(config.stages)
+    if remaining == 0:
+        raise ValueError(
+            f"{config.stock_code}: 잔량이 0 이므로 강제 종료가 아니라 정상 "
+            f"종료로 처리된다 (설계서 11.4절 절차 ③)"
+        )
+    return ForceCloseDialogView(
+        config_id=config.config_id, stock_code=config.stock_code,
+        stock_name=config.stock_name, remaining_qty=remaining,
+        holding_stages=pnl.holding_stage_count(config.stages),
+        attempts=attempts, last_attempt_at=last_attempt_at,
+        last_failure_detail=last_failure_detail,
+    )
+
+
+def build_status_bar(
+    *, fallback_active: bool, last_reconcile: ReconcileMismatch | None,
+    total_used: int, total_limit: int,
+) -> StatusBarView:
+    """설계서 14.1절 하단 — `시세 WebSocket │ 대사 09:40 일치 │ 총한도 …`."""
+    if last_reconcile is None:
+        reconcile_label = "대사 일치"
+    else:
+        reconcile_label = (
+            f"대사 {last_reconcile.at:%H:%M} {last_reconcile.stock_code} "
+            f"{last_reconcile.verdict}"
+        )
+    return StatusBarView(
+        quote_source_label=("시세 REST 폴백" if fallback_active
+                            else "시세 WebSocket"),
+        last_reconcile_label=reconcile_label,
+        total_used=total_used, total_limit=total_limit,
+        # 한도가 0 이면 나누지 않는다 — 설정 전이나 잘못된 설정에서 그 상태가 된다.
+        used_pct=(None if total_limit == 0
+                  else (Decimal(total_used) / total_limit * 100).quantize(
+                      _TENTH, rounding=ROUND_HALF_UP)),
+    )
+
+
+def build_banner(
+    *, env: str, fallback_active: bool, engine_error: str | None,
+) -> BannerView:
+    """설계서 14.1절 상단.
+
+    알 수 없는 환경을 거부하는 이유: 조용히 모의투자로 떨어지면 사용자가
+    실전이라고 믿는 채로 돌린다. 색은 위젯이 `is_real` 로 정한다.
+    """
+    if env not in _ENV_LABELS:
+        raise ValueError(f"env must be one of {sorted(_ENV_LABELS)}: {env!r}")
+    return BannerView(
+        env_label=_ENV_LABELS[env], is_real=(env == "real"),
+        connection_label=("● REST 폴백" if fallback_active else "● WS 연결"),
+        engine_error=engine_error,
+    )
