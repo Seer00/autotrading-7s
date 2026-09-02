@@ -17,7 +17,16 @@ from datetime import datetime
 from decimal import Decimal
 
 from autotrading7s.domain.cycle import Cycle
-from autotrading7s.domain.ladder import Ladder, target_price
+# _require_int·_require_ratio 는 "금액은 int, 비율은 Decimal"(설계서 3.1절)을
+# 코드로 옮긴 것이며 ladder.py 에서 처음 필요해 거기에 있다. rules 는 이미
+# ladder 에 의존하므로 의존 방향이 새로 생기지 않는다 — 같은 관용구를 여기에
+# 다시 쓰면 두 곳의 메시지가 갈라진다.
+from autotrading7s.domain.ladder import (
+    Ladder,
+    _require_int,
+    _require_ratio,
+    target_price,
+)
 from autotrading7s.domain.stage import StageState
 from autotrading7s.domain.types import StageStatus, Tick
 
@@ -31,6 +40,24 @@ class TriggerParams:
     rebuy_cooldown_sec: int = 60
 
     def __post_init__(self) -> None:
+        # 타입 검사가 값 검사보다 먼저다. target_pct 는 특히 중요하다 —
+        # decide() 의 목표율 대조로는 float 을 잡을 수 없기 때문이다. Decimal 은
+        # float 과 정확한 값으로 비교되므로 2진수로 정확한 비율(0.25·0.5·
+        # 0.125·0.0625 …)은 서로 같다고 나오고, 대조를 통과한 float 이
+        # target_price 까지 흘러가 매 틱 TypeError 를 낸다. 손절매가 없는 이
+        # 전략에서 그 결과는 "그 종목은 어떤 단계도 팔지 못한다" 이므로,
+        # 값이 들어오는 이 경계에서 막아야 한다.
+        _require_ratio("target_pct", self.target_pct)
+        _require_int("rebuy_cooldown_sec", self.rebuy_cooldown_sec)
+        # 재매수 허용은 진리값이 아니라 bool 이어야 한다. _eval_buy 가
+        # `if not params.allow_rebuy` 로 읽으므로 "false" 같은 문자열은 참으로
+        # 해석되어 사용자가 끈 재매수를 켠다. Plan 2 의 SQLite 는 boolean 을
+        # 0/1 로 돌려주므로 그 변환을 저장소 경계에서 하도록 int 도 거절한다.
+        if not isinstance(self.allow_rebuy, bool):
+            raise TypeError(
+                f"allow_rebuy must be bool, not {type(self.allow_rebuy).__name__}"
+            )
+
         if self.target_pct <= 0:
             raise ValueError(f"target_pct must be positive: {self.target_pct}")
         if self.rebuy_cooldown_sec < 0:

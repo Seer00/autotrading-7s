@@ -342,6 +342,34 @@ def test_anchor_without_ladder_is_rejected_in_every_status(status: CycleStatus):
         Cycle(cycle_id=1, config_id=1, seq=1, status=status, anchor_price=10_000)
 
 
+@pytest.mark.parametrize(
+    "status",
+    [CycleStatus.IDLE, CycleStatus.STARTING, CycleStatus.LIQUIDATING,
+     CycleStatus.CLOSED],
+)
+def test_ladder_without_anchor_is_rejected(status: CycleStatus):
+    """사다리가 있으면 앵커도 있어야 한다 — 앵커 없이 사다리만 있는 행은 손상이다.
+
+    "앵커가 있으면 사다리 필수" 의 거울상이다. 둘은 `confirm_anchor` 에서 같은
+    순간에 생기므로 한쪽만 있는 행은 어느 상태에서도 성립하지 않는다.
+    RUNNING·PAUSED 는 앵커를 먼저 요구하므로 이 검사에 닿지 않는다.
+    """
+    with pytest.raises(ValueError, match="requires anchor_price"):
+        Cycle(cycle_id=1, config_id=1, seq=1, status=status, ladder=ladder())
+
+
+@pytest.mark.parametrize(
+    "status",
+    [CycleStatus.IDLE, CycleStatus.STARTING, CycleStatus.LIQUIDATING,
+     CycleStatus.CLOSED],
+)
+def test_neither_anchor_nor_ladder_still_constructs(status: CycleStatus):
+    """둘 다 없는 것은 정상이다 — 앵커가 확정되기 전의 사이클과 종료된 사이클."""
+    cyc = Cycle(cycle_id=1, config_id=1, seq=1, status=status)
+    assert cyc.anchor_price is None
+    assert cyc.ladder is None
+
+
 @pytest.mark.parametrize("status", list(CycleStatus))
 def test_matching_anchor_and_ladder_constructs_in_every_status(status: CycleStatus):
     """일치하면 어떤 상태에서도 구성된다 — 검사는 불일치만 막는다."""

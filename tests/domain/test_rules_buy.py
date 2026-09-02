@@ -270,6 +270,43 @@ def test_trigger_params_valid_defaults_construct():
     assert params.rebuy_cooldown_sec == 60
 
 
+@pytest.mark.parametrize("bad_value", [0.05, 0.25, 0.5, 0.125, 0.0625, 1, True])
+def test_trigger_params_rejects_non_decimal_target_pct(bad_value: object):
+    """목표율은 Decimal 이다 — float 은 여기서 막아야 한다.
+
+    `decide()` 의 목표율 대조로는 이 값을 잡을 수 없다. Decimal 은 float 과
+    **정확한 값**으로 비교되므로, 2진수로 정확히 표현되는 비율은 서로 같다고
+    나온다: `Decimal("0.25") == 0.25` 는 참이다. 그러면 대조를 통과한 float 이
+    `target_price` 까지 흘러가 매 틱 TypeError 를 내고, 손절매가 없는 이
+    전략에서 그 종목은 어떤 단계도 팔지 못한다. 25%·12.5%·50%·6.25% 는
+    모두 있을 수 있는 목표율이다.
+    """
+    with pytest.raises(TypeError, match="target_pct must be Decimal"):
+        TriggerParams(target_pct=bad_value)  # type: ignore[arg-type]
+
+
+def test_trigger_params_accepts_decimal_target_pct():
+    """Decimal 목표율은 그대로 구성된다 — 막는 것은 타입뿐이다."""
+    params = TriggerParams(target_pct=Decimal("0.05"))
+    assert params.target_pct == Decimal("0.05")
+
+
+def test_float_target_pct_fails_at_construction_not_at_every_tick():
+    """사다리와 매개변수가 "같은" 값을 들고도 매 틱 예외가 나던 경로의 회귀 테스트.
+
+    Ladder 의 Decimal("0.25") 와 TriggerParams 의 float 0.25 는 대조를
+    통과했다(두 값이 같다). 이제 TriggerParams 구성 시점에 막히므로
+    decide() 는 호출조차 되지 않는다.
+    """
+    lad = Ladder(anchor_price=10_000, drop_pct=FIVE, target_pct=Decimal("0.25"),
+                 max_stages=7, amount_per_stage=1_000_000)
+    assert lad.target_pct == Decimal("0.25")
+    with pytest.raises(TypeError, match="target_pct must be Decimal"):
+        TriggerParams(target_pct=0.25)  # type: ignore[arg-type]
+    # 대조 검사만으로는 막히지 않았음을 함께 못박는다.
+    assert Decimal("0.25") == 0.25, "Decimal 은 float 과 정확한 값으로 비교된다"
+
+
 # 사다리와 매개변수의 목표율은 같은 값이어야 한다.
 
 def test_target_pct_mismatch_raises():

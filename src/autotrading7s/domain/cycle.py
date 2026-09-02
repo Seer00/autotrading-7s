@@ -71,6 +71,14 @@ class Cycle:
             raise ValueError(
                 f"Cycle status {self.status.value} requires ladder, got None"
             )
+        # 거울상: 사다리만 있고 앵커가 없는 행도 손상이다. 위 검사와 같은
+        # 이유이며(둘은 confirm_anchor 에서 같은 순간에 생긴다), RUNNING·
+        # PAUSED 는 첫 검사가 이미 앵커를 요구하므로 여기 닿지 않는다.
+        if self.anchor_price is None and self.ladder is not None:
+            raise ValueError(
+                f"Cycle status {self.status.value} with ladder "
+                "requires anchor_price, got None"
+            )
         # 두 값이 모두 있으면 반드시 같은 앵커를 가리켜야 한다 — 상태와
         # 무관하다. 사다리는 앵커에서 전부 파생되므로 두 값이 다르면 어느 쪽이
         # 진실인지 알 방법이 없다.

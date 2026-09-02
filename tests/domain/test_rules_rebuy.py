@@ -57,6 +57,27 @@ def test_rule3_cooldown_boundary(elapsed_sec: int, expect_buy: bool):
         assert decisions[0].stage_no == 2
 
 
+@pytest.mark.parametrize("bad_value", [60.0, True, Decimal(60)])
+def test_rejects_non_int_cooldown(bad_value: object):
+    """쿨다운은 초 단위 int 다. float 초는 경과시간 비교를 흐리고, bool 은
+    `True == 1` 이라 1초 쿨다운으로 조용히 해석된다."""
+    with pytest.raises(TypeError, match="rebuy_cooldown_sec must be int"):
+        TriggerParams(target_pct=FIVE, rebuy_cooldown_sec=bad_value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("bad_value", [1, 0, "false", None])
+def test_rejects_non_bool_allow_rebuy(bad_value: object):
+    """재매수 허용은 bool 이다 — 진리값으로 해석하면 설정이 뒤집힐 수 있다.
+
+    `_eval_buy` 는 `if not params.allow_rebuy` 로 이 값을 읽는다. 문자열
+    "false" 는 참이므로 사용자가 끈 재매수가 켜진 것으로 읽힌다. Plan 2 의
+    SQLite 는 boolean 을 0/1 로 돌려주므로, 그 변환을 저장소 경계에서
+    명시적으로 하도록 여기서 int 도 거절한다.
+    """
+    with pytest.raises(TypeError, match="allow_rebuy must be bool"):
+        TriggerParams(target_pct=FIVE, allow_rebuy=bad_value)  # type: ignore[arg-type]
+
+
 def test_custom_cooldown_is_honored():
     lad = ladder()
     params = TriggerParams(target_pct=FIVE, allow_rebuy=True, rebuy_cooldown_sec=300)
