@@ -111,16 +111,64 @@ async def test_preexisting_holdings_can_be_sold():
 
 
 @pytest.mark.asyncio
-async def test_transport_failure_wins_over_validation():
-    """FailMode 는 거래소보다 앞단이다 — 타임아웃은 등록한 뒤 던진다.
+async def test_timeout_still_registers_a_valid_order():
+    """설계서 9절 ⑤ 의 "접수됨" 분기 — 유효한 주문은 등록한 뒤 던진다.
 
-    순서가 뒤집히면 fail_after 의 의미("실패할 수 있었던 호출 N번")가 깨진다.
+    엔진이 list_orders_today 로 접수를 확인하고 체결을 기다리는 경로가 이
+    조합에서 나온다.
     """
-    broker = FakeBroker([10_000], cash=1, validate_account=True,
+    broker = FakeBroker([10_000], cash=100_000_000, validate_account=True,
                         fail_mode=FailMode.TIMEOUT)
     with pytest.raises(BrokerTimeout):
         await broker.place_limit_order(_buy(qty=100, price=10_000))
     assert len(await broker.list_orders_today("005930")) == 1
+
+
+@pytest.mark.asyncio
+async def test_timeout_does_not_bypass_account_validation():
+    """검증이 전송 실패보다 먼저 온다 — 배경 보안 리뷰가 지적한 우회.
+
+    타임아웃은 "응답이 유실됐다" 는 뜻이고 "거래소가 받아줬다" 는 뜻이
+    아니다. 검증을 나중에 두면 TIMEOUT 을 주입한 모든 시나리오에서
+    validate_account 가 조용히 무력화되고, 예수금 1원으로 1,000,000원 주문이
+    등록·체결된다. **G2 시나리오 7(응답 타임아웃)이 정확히 그 조합이므로**,
+    그 게이트가 한도를 전혀 검사하지 않게 된다.
+
+    거부된 주문은 등록되지 않아야 한다. 등록되면 엔진의 UNKNOWN 조회가
+    "접수됨" 으로 오판하고 있지도 않은 주문의 체결을 기다린다.
+    """
+    broker = FakeBroker([10_000], cash=1, validate_account=True,
+                        fail_mode=FailMode.TIMEOUT)
+    with pytest.raises(BrokerRejected) as exc:
+        await broker.place_limit_order(_buy(qty=100, price=10_000))
+    assert exc.value.code == "40940"
+    assert await broker.list_orders_today("005930") == []
+    # get_balance 는 TIMEOUT 모드에서 실패하도록 2A 가 만들어 뒀으므로
+    # (설계서 10.2절 대사가 잔고 조회 실패를 다뤄야 한다) 모드를 해제한 뒤 본다
+    broker.clear_failure()
+    assert (await broker.get_balance()).cash == 1
+
+
+@pytest.mark.asyncio
+async def test_validation_failure_does_not_consume_the_fail_budget():
+    """검증에 걸린 주문은 전송 계층에 도달하지 못했다.
+
+    카운터를 소모하면 `fail_after` 가 "실패할 수 있었던 호출 N번" 이라는
+    의미를 잃고, 실패 지점이 무관한 거부 건수에 따라 움직인다 — 2A 가
+    get_balance 에 대해 이미 고친 결함과 같은 모양이다.
+    """
+    broker = FakeBroker([10_000], cash=1_000_000, validate_account=True,
+                        fail_mode=FailMode.TIMEOUT, fail_after=1)
+    # 보유가 없으므로 검증에서 거부된다 — 예산을 소모하지 않아야 한다
+    with pytest.raises(BrokerRejected):
+        await broker.place_limit_order(_sell(qty=10, price=10_000))
+    # 첫 유효 주문은 fail_after=1 이므로 통과한다
+    ack = await broker.place_limit_order(_buy(qty=100, price=10_000))
+    assert ack.broker_order_id
+    # 두 번째 유효 주문에서 타임아웃이 난다
+    broker._cash = 100_000_000
+    with pytest.raises(BrokerTimeout):
+        await broker.place_limit_order(_buy(qty=100, price=10_000))
 
 
 @pytest.mark.asyncio

@@ -30,11 +30,12 @@ from autotrading7s.domain.errors import DomainInvariantError
 from autotrading7s.domain.ladder import Ladder
 from autotrading7s.domain.stage import StageState
 from autotrading7s.domain.types import CloseReason, CycleStatus, StageStatus
-from autotrading7s.ports.repository import SplitConfig
+from autotrading7s.ports.repository import (  # noqa: F401 — 재수출
+    CorruptRowError,
+    SplitConfig,
+)
 
 
-class CorruptRowError(DomainInvariantError):
-    """복원된 행이 도메인 불변식을 만족하지 않을 때. 어느 행인지 지목한다."""
 
 
 def _corrupt(table: str, rowid: object, cause: Exception) -> CorruptRowError:

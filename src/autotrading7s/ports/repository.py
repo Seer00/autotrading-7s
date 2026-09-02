@@ -16,9 +16,20 @@ from decimal import Decimal
 from typing import Protocol, runtime_checkable
 
 from autotrading7s.domain.cycle import Cycle
+from autotrading7s.domain.errors import DomainInvariantError
 from autotrading7s.domain.ladder import Ladder
 from autotrading7s.domain.stage import StageState
 from autotrading7s.domain.types import CycleStatus, OrderPath, Side
+
+
+class CorruptRowError(DomainInvariantError):
+    """저장된 행에서 도메인 객체를 복원할 수 없다 — 테이블과 rowid 를 지목한다.
+
+    호출자 버그(`TypeError`)와 구분되며, 엔진이 이것을 잡아 그 사이클만
+    격리한다. 예외를 포트에 두는 이유는 브로커 예외와 같다: `engine/` 은
+    `adapters/` 를 알지 못하므로, 예외가 어댑터에만 있으면 엔진은 넓은
+    `except ValueError` 를 쓰게 되고 그것은 DB 손상을 삼킨다 (2A 핸드오버 7).
+    """
 
 
 class OrderLogNotFound(LookupError):
@@ -228,6 +239,15 @@ class RepositoryPort(Protocol):
         완전성·대조 실패는 `CorruptRowError` 를 낸다 — `DomainInvariantError`
         (→ `ValueError`)의 하위다. `load_config` 의 같은 경고가 여기도
         적용된다.
+        """
+        ...
+
+    def stage_row_id(self, cycle_id: int, stage_no: int) -> int:
+        """`stage_state` 행의 id. 없으면 `RowNotFound`.
+
+        `order_log.stage_state_id` 를 채우기 위해 필요하다. 이 연결이 없으면
+        재시작 복구가 미체결 주문이 어느 단계의 것인지 알 수 없고, 설계서
+        10.1절 2단계('체결됨 → HOLDING 으로 정정')를 수행할 방법이 없다.
         """
         ...
 

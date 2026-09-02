@@ -25,13 +25,17 @@ def a_config(**over) -> SplitConfig:
 
 
 def test_repository_port_declares_the_expected_methods():
-    """Task 8~10 이 채워야 하는 목록. 여기가 고정되어야 진행 상황을 셀 수 있다."""
+    """포트의 전체 메서드 목록. 집합으로 단정하므로 추가·삭제가 눈에 띈다.
+
+    Plan 2B 가 추가한 것: `stage_row_id`(order_log.stage_state_id 를 채우기
+    위해 — 없으면 재시작 복구가 미체결 주문을 어느 단계의 것인지 알 수 없다).
+    """
     expected = {
         # 설정
         "save_config", "load_config", "list_configs", "set_config_status",
         # 사이클과 단계
         "create_cycle", "load_cycle", "save_cycle", "load_stages", "save_stage",
-        "load_active_cycles",
+        "load_active_cycles", "stage_row_id",
         # 주문 이력과 실현손익
         "append_order_log", "update_order_log", "load_pending_orders",
         "realized_pnl_for_cycle",

@@ -154,6 +154,23 @@ class SqliteRepository:
             [dict(r) for r in rows], cycle_id=cycle_id, ladder=cycle.ladder
         )
 
+    def stage_row_id(self, cycle_id: int, stage_no: int) -> int:
+        """`stage_state` 행의 id — `order_log.stage_state_id` 를 채우는 데 쓴다.
+
+        사이클로 범위를 좁히는 것이 중요하다. `UNIQUE(cycle_id, stage_no)` 가
+        있으므로 두 열이 함께여야 행 하나를 지목하며, `stage_no` 만으로 찾으면
+        다른 사이클의 단계에 주문이 붙는다.
+        """
+        row = self._conn.execute(
+            "SELECT id FROM stage_state WHERE cycle_id = ? AND stage_no = ?",
+            (cycle_id, stage_no),
+        ).fetchone()
+        if row is None:
+            raise RowNotFound(
+                f"no stage_state row for cycle_id={cycle_id} stage_no={stage_no}"
+            )
+        return int(dict(row)["id"])
+
     def save_stage(self, cycle_id: int, stage: StageState) -> None:
         """(cycle_id, stage_no) 로 upsert. 없는 행이면 그냥 만든다(초기 저장).
 
