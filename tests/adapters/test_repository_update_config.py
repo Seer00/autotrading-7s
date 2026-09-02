@@ -82,3 +82,54 @@ def test_update_config_does_not_change_created_at(repo_two_stocks):
 
 def test_port_declares_update_config():
     assert "update_config" in RepositoryPort.__protocol_attrs__
+
+
+def test_update_config_refuses_to_change_the_stock_code(repo_two_stocks):
+    """`integrity-control-bypass` — 배경 보안 리뷰가 지적한 것.
+
+    `forced_close_baseline` 이 `cycle` 을 `split_config.stock_code` 로 조인하므로
+    종목 코드를 바꾸면 **강제 종료 대사 기준선이 조용히 다른 종목으로 옮겨간다.**
+    그러면 강제 종료한 적 없는 종목에서 실제 불일치가 그만큼 상쇄되고 D13 자동
+    정지가 발동하지 않는다 — 대사는 프로그램이 브로커와의 어긋남을 잡는 유일한
+    장치다.
+
+    설정은 특정 종목에 대한 계획이므로 종목을 바꾸는 것은 애초에 다른 설정이다.
+    """
+    repo_two_stocks.set_config_status(1, "IDLE", at=AT)
+    moved = dataclasses.replace(repo_two_stocks.load_config(1),
+                                stock_code="035720", stock_name="카카오")
+    with pytest.raises(ValueError, match="stock_code"):
+        repo_two_stocks.update_config(moved, at=AT)
+    assert repo_two_stocks.load_config(1).stock_code == "005930"
+
+
+def test_the_baseline_stays_with_the_stock_that_was_force_closed(
+    repo_two_stocks,
+):
+    """위 거부가 실제로 무엇을 지키는지 보여준다.
+
+    강제 종료된 100주의 기준선이 005930 에 남아 있어야, 035720 의 실제 100주
+    불일치가 상쇄되지 않고 D13 자동 정지가 발동한다.
+    """
+    from autotrading7s.domain import cycle as cycle_mod
+    from autotrading7s.domain import stage as stage_mod
+
+    cyc = repo_two_stocks.load_active_cycles()[0]
+    liq = cycle_mod.begin_liquidation(cyc)
+    repo_two_stocks.save_cycle(liq)
+    sold = [stage_mod.force_sold(s, at=AT)
+            for s in repo_two_stocks.load_stages(cyc.cycle_id)]
+    repo_two_stocks.emergency_close_cycle(
+        cycle=cycle_mod.force_close(liq, reason="거래정지", qty=100, at=AT),
+        stages=sold)
+    assert repo_two_stocks.forced_close_baseline("005930") == 100
+    assert repo_two_stocks.forced_close_baseline("035720") == 0
+
+    repo_two_stocks.set_config_status(1, "IDLE", at=AT)
+    with pytest.raises(ValueError, match="stock_code"):
+        repo_two_stocks.update_config(
+            dataclasses.replace(repo_two_stocks.load_config(1),
+                                stock_code="035720"), at=AT)
+
+    assert repo_two_stocks.forced_close_baseline("005930") == 100
+    assert repo_two_stocks.forced_close_baseline("035720") == 0

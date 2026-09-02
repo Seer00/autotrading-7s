@@ -178,6 +178,24 @@ class GuardBlocked(Event):
 
 
 @dataclass(frozen=True, slots=True)
+class CommandFailed(Event):
+    """명령 하나가 예외로 실패했다 — 루프는 다음 명령으로 넘어갔다.
+
+    이 이벤트가 없으면 실패가 조용히 사라지거나(삼킴) 명령 소비 루프가 죽는다.
+    **후자가 더 나쁘다**: 설계서 7.1절이 `priority_q` 로 보장하려는 것은 "긴급
+    명령이 즉시 처리된다" 인데, 루프가 죽으면 그 뒤의 모든 긴급청산이 영구히
+    처리되지 않는다.
+    """
+
+    command: str
+    detail: str
+    at: datetime
+
+    def __post_init__(self) -> None:
+        _require_aware(self.at)
+
+
+@dataclass(frozen=True, slots=True)
 class ConfigSaved(Event):
     config_id: int
     at: datetime

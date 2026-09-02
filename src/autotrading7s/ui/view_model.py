@@ -18,11 +18,11 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from autotrading7s.app.snapshot import ConfigSnapshot, Snapshot
 from autotrading7s.domain import pnl
-from autotrading7s.domain.ladder import target_price
+from autotrading7s.domain.ladder import Ladder, target_price
 from autotrading7s.domain.types import CycleStatus, StageStatus
 
 BROKER_AVG_NOTICE = (
@@ -236,3 +236,137 @@ def build_stage_detail(
         anchor_price=config.anchor_price, started_at=config.cycle_started_at,
         rows=tuple(rows),
     )
+
+
+# ── 사다리 미리보기 (설계서 14.2절) ─────────────────────────────────────
+LADDER_PREVIEW_NOTICE = (
+    "실제 앵커는 1단계 체결가로 확정되며, 각 단계 목표가는 발동가가 아니라 "
+    "실제 체결가 기준으로 계산됩니다."
+)
+
+_REQUIRED_TEXT = ("stock_code",)
+_OPTIONAL_TEXT = ("stock_name", "label")
+_INT_FIELDS = ("max_stages", "amount_per_stage", "rebuy_cooldown_sec",
+               "total_limit")
+_PCT_FIELDS = ("drop_pct", "target_pct")
+_TRUTHY = ("1", "true", "True", "yes", "on")
+
+
+class FormError(Exception):
+    """입력란 하나의 형식 오류. 메시지에 필드 이름이 들어간다.
+
+    위젯이 그 이름으로 어느 입력란 옆에 표시할지 결정한다.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class LadderPreviewRow:
+    stage_no: int
+    trigger_price: int
+    qty: int
+    investment: int
+    target_price: int
+    cumulative: int
+
+
+@dataclass(frozen=True, slots=True)
+class LadderPreview:
+    rows: tuple[LadderPreviewRow, ...]
+    total_investment: int
+    stock_limit: int
+    headroom: int
+    over_limit: bool
+    last_drop_pct: Decimal
+    full_avg_price: int
+    full_avg_drop_pct: Decimal
+    notice: str = LADDER_PREVIEW_NOTICE
+
+
+def _pct_vs(value: int, anchor: int) -> Decimal:
+    return (Decimal(value - anchor) / anchor * 100).quantize(
+        _TENTH, rounding=ROUND_HALF_UP)
+
+
+def build_ladder_preview(
+    *, anchor_price: int, max_stages: int, drop_pct: Decimal,
+    target_pct: Decimal, amount_per_stage: int, stock_limit: int,
+) -> LadderPreview:
+    """설계서 14.2절 사다리 미리보기.
+
+    `Ladder` 를 그대로 쓴다 — 미리보기가 계산을 다시 구현하면 화면의 숫자와
+    실제 사다리가 어긋나고, 그 어긋남은 사용자가 저장한 뒤에야 드러난다.
+    `Ladder` 의 불변식(1단계에서 1주 이상)도 그대로 통과시킨다: 미리보기가
+    도메인보다 관대하면 화면에서 괜찮아 보이는 설정이 저장에서 거부된다.
+
+    **미리보기는 발동가를 체결가로 가정한다.** 설계서 목업의 ⓘ 문구가 그
+    사실을 명시하며, `notice` 가 그 문구를 담아 화면이 반드시 보여주게 한다 —
+    없으면 사용자가 미리보기의 목표가를 확정된 값으로 읽는다.
+
+    전 단계 보유 시 평단과 앵커 대비 하락률이 중요한 이유: 손절매가 없는
+    전략에서 그 숫자가 사용자가 최악의 경우를 가늠하는 유일한 수단이다.
+    """
+    ladder = Ladder(anchor_price=anchor_price, drop_pct=drop_pct,
+                    target_pct=target_pct, max_stages=max_stages,
+                    amount_per_stage=amount_per_stage)
+    rows: list[LadderPreviewRow] = []
+    cumulative = 0
+    total_qty = 0
+    for n in range(1, max_stages + 1):
+        investment = ladder.planned_investment(n)
+        cumulative += investment
+        total_qty += ladder.planned_qty(n)
+        rows.append(LadderPreviewRow(
+            stage_no=n, trigger_price=ladder.trigger_price(n),
+            qty=ladder.planned_qty(n), investment=investment,
+            target_price=target_price(ladder.trigger_price(n), target_pct),
+            cumulative=cumulative,
+        ))
+    full_avg = int((Decimal(cumulative) / total_qty).to_integral_value(
+        rounding=ROUND_HALF_UP))
+    return LadderPreview(
+        rows=tuple(rows), total_investment=cumulative, stock_limit=stock_limit,
+        headroom=stock_limit - cumulative, over_limit=cumulative > stock_limit,
+        last_drop_pct=_pct_vs(ladder.trigger_price(max_stages), anchor_price),
+        full_avg_price=full_avg,
+        full_avg_drop_pct=_pct_vs(full_avg, anchor_price),
+    )
+
+
+def parse_config_form(fields: Mapping[str, str]) -> dict[str, object]:
+    """설정 등록 폼의 문자열을 `SaveConfig` 가 받는 타입으로 바꾼다.
+
+    반환한 dict 를 그대로 `SaveConfig(config_id=..., **parsed)` 에 넘길 수
+    있어야 한다 — 이름이 하나라도 어긋나면 위젯이 그 차이를 손으로 메우게
+    되고, 그 코드는 EC2 에서 검증되지 않는 곳에 들어간다.
+
+    `NaN`·`Infinity` 를 명시적으로 거부하는 이유: `Decimal("NaN")` 은
+    만들어지고 그 뒤 도메인이 `decimal.InvalidOperation` 을 던지는데, 그것은
+    `ArithmeticError` 이지 `ValueError` 가 아니므로 호출자의 넓은
+    `except ValueError` 로도 잡히지 않는다 (Plan 1 의 기록).
+    """
+    out: dict[str, object] = {}
+    for name in _REQUIRED_TEXT:
+        text = (fields.get(name) or "").strip()
+        if not text:
+            raise FormError(f"{name}: 값을 입력하세요")
+        out[name] = text
+    for name in _OPTIONAL_TEXT:
+        text = (fields.get(name) or "").strip()
+        out[name] = text or None
+    for name in _INT_FIELDS:
+        text = (fields.get(name) or "").strip().replace(",", "")
+        try:
+            out[name] = int(text)
+        except ValueError:
+            raise FormError(f"{name}: 정수를 입력하세요 ({text!r})") from None
+    for name in _PCT_FIELDS:
+        text = (fields.get(name) or "").strip().replace("%", "")
+        try:
+            percent = Decimal(text)
+        except InvalidOperation:
+            raise FormError(f"{name}: 숫자를 입력하세요 ({text!r})") from None
+        if not percent.is_finite():
+            raise FormError(f"{name}: 유한한 숫자를 입력하세요 ({text!r})")
+        out[name] = percent / 100
+    out["allow_rebuy"] = (fields.get("allow_rebuy") or "").strip() in _TRUTHY
+    return out

@@ -110,7 +110,7 @@ class SqliteRepository:
                 "update_config requires config_id; use save_config for a new row"
             )
         current = self._conn.execute(
-            "SELECT status FROM split_config WHERE id = ?",
+            "SELECT status, stock_code FROM split_config WHERE id = ?",
             (config.config_id,),
         ).fetchone()
         if current is None:
@@ -120,6 +120,18 @@ class SqliteRepository:
                 f"config {config.config_id} is {dict(current)['status']} — "
                 f"IDLE 설정만 수정할 수 있다 (진행 중인 사이클의 사다리와 "
                 f"어긋난다)"
+            )
+        if dict(current)["stock_code"] != config.stock_code:
+            # 설정은 특정 종목에 대한 계획이므로 종목을 바꾸는 것은 다른
+            # 설정이다. 더 중요하게는, `forced_close_baseline` 이 `cycle` 을
+            # `split_config.stock_code` 로 조인하므로 **강제 종료 대사 기준선이
+            # 조용히 다른 종목으로 옮겨간다** — 그러면 강제 종료한 적 없는
+            # 종목에서 실제 불일치가 상쇄되고 D13 자동 정지가 발동하지 않는다.
+            # 배경 보안 리뷰가 지적한 integrity-control-bypass 가 이것이다.
+            raise ValueError(
+                f"stock_code 는 바꿀 수 없다: "
+                f"{dict(current)['stock_code']} → {config.stock_code} "
+                f"(강제 종료 대사 기준선이 다른 종목으로 옮겨간다)"
             )
         # `config_to_row` 는 status·created_at·updated_at 을 모두 담는다.
         # status 는 set_config_status 의 몫이고, created_at 은 최초 등록 시각

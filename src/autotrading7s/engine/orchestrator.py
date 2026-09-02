@@ -29,6 +29,7 @@ from datetime import timedelta
 
 from autotrading7s.app import commands as cmd
 from autotrading7s.app.events import (
+    CommandFailed,
     ConfigRejected,
     ConfigSaved,
     CycleClosed,
@@ -111,11 +112,34 @@ class Orchestrator:
                     command = q.get_nowait()
                 except queue.Empty:
                     break
-                await self._handle(command)
+                await self._safe_handle(command)
                 handled = True
         if handled:
             # [시작]을 눌렀는데 화면이 그대로면 사용자는 눌렸는지 알 수 없다.
             self.emit_snapshot_if_changed()
+
+    async def _safe_handle(self, command: cmd.Command) -> None:
+        """명령 **하나 단위로** 예외를 격리한다.
+
+        여기서 예외가 빠져나가면 `drain_commands` → `run()` 을 거쳐 엔진
+        스레드가 죽고, **그 시점부터 모든 명령이 영구히 처리되지 않는다** —
+        설계서 7.1절이 `priority_q` 로 보장하려는 "긴급 명령의 즉시성" 이
+        앞선 일반 명령 하나의 실패로 무너진다. 배경 보안 리뷰가 지적한
+        `unhandled-exception-kills-priority-command-loop` 가 이것이다.
+
+        **삼키는 것이 아니다.** 잡은 예외는 `CommandFailed` 로 화면에 나가고
+        루프는 다음 명령으로 넘어간다. 이것이 이 코드베이스에서 넓은 `except`
+        가 옳은 유일한 자리이며, 그 이유는 대안(루프 사망)이 더 나쁘다는 것
+        하나다.
+        """
+        try:
+            await self._handle(command)
+        except Exception as exc:                          # noqa: BLE001
+            self._emit(CommandFailed(
+                command=type(command).__name__,
+                detail=f"{type(exc).__name__}: {exc}",
+                at=self._clock.now(),
+            ))
 
     async def _handle(self, command: cmd.Command) -> None:
         if isinstance(command, cmd.EmergencyLiquidate):
@@ -204,6 +228,18 @@ class Orchestrator:
                 raise ValueError(
                     f"total_limit must be non-negative: {command.total_limit}"
                 )
+            # 스키마의 UNIQUE(stock_code, label) 가 최종 방어선이지만 그
+            # IntegrityError 는 사용자에게 "같은 이름의 설정이 이미 있다" 를
+            # 말해주지 않는다.
+            for other in self._repo.list_configs():
+                if (other.config_id != command.config_id
+                        and other.stock_code == command.stock_code
+                        and other.label == command.label):
+                    raise ValueError(
+                        f"{command.stock_code} 에 이미 "
+                        f"{command.label!r} 이름의 설정이 있습니다 "
+                        f"(config_id={other.config_id})"
+                    )
             config = SplitConfig(
                 config_id=command.config_id, stock_code=command.stock_code,
                 stock_name=command.stock_name, label=command.label,

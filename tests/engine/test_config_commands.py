@@ -178,3 +178,98 @@ def test_save_config_carries_typed_values_only():
                    amount_per_stage="1000000",  # type: ignore[arg-type]
                    allow_rebuy=True, rebuy_cooldown_sec=60,
                    total_limit=7_000_000)
+
+
+# ── 배경 보안 리뷰가 지적한 세 건 ───────────────────────────────────────
+@pytest.mark.asyncio
+async def test_one_failing_command_does_not_kill_the_loop(repo_two_stocks):
+    """`unhandled-exception-kills-priority-command-loop`.
+
+    예외가 `drain_commands` 를 빠져나가면 `run()` 을 거쳐 엔진 스레드가 죽고
+    **그 시점부터 모든 명령이 영구히 처리되지 않는다** — 설계서 7.1절이
+    priority_q 로 보장하려는 긴급 명령의 즉시성이 앞선 일반 명령 하나의
+    실패로 무너진다.
+    """
+    from autotrading7s.app.commands import StartCycle
+    from autotrading7s.app.events import CommandFailed
+
+    broker = FakeBroker([10_000], validate_account=True)
+    orch, (command_q, _, event_q) = _build(repo_two_stocks, broker)
+
+    boom = StartCycle(config_id=9999)      # 없는 설정 → 리포지토리가 던진다
+    command_q.put(boom)
+    command_q.put(_new())                  # 뒤에 쌓인 정상 명령
+
+    await orch.drain_commands()            # 예외가 새어나오지 않아야 한다
+
+    events = _drain(event_q)
+    failed = [e for e in events if isinstance(e, CommandFailed)]
+    assert len(failed) == 1
+    assert failed[0].command == "StartCycle"
+    # 뒤에 쌓인 명령이 처리됐다
+    assert [e for e in events if isinstance(e, ConfigSaved)]
+    assert command_q.empty()
+
+
+@pytest.mark.asyncio
+async def test_a_failing_command_does_not_swallow_the_emergency_behind_it(
+    repo_two_stocks,
+):
+    """긴급청산이 앞선 실패에 묻히면 안 된다 — 그것이 이 격리의 요점이다."""
+    from autotrading7s.app.commands import EmergencyLiquidate, StartCycle
+    from autotrading7s.app.events import CommandFailed, EmergencyResult
+
+    broker = FakeBroker([10_000], validate_account=True,
+                        holdings={"005930": (100, 1_000_000)})
+    orch, (command_q, priority_q, event_q) = _build(repo_two_stocks, broker)
+    priority_q.put(StartCycle(config_id=9999))     # priority_q 의 실패
+    priority_q.put(EmergencyLiquidate(scope="SINGLE", config_id=1,
+                                      reason="긴급", confirmed_text=None))
+
+    await orch.drain_commands()
+
+    events = _drain(event_q)
+    assert [e for e in events if isinstance(e, CommandFailed)]
+    results = [e for e in events if isinstance(e, EmergencyResult)]
+    assert results and results[0].result == "SUCCESS"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_name_is_rejected_with_a_readable_message(
+    repo_two_stocks,
+):
+    """스키마의 UNIQUE(stock_code, label) 가 최종 방어선이지만 그
+    IntegrityError 는 사용자에게 "같은 이름의 설정이 이미 있다" 를 말해주지
+    않는다 — 그리고 그 예외는 ValueError 도 TypeError 도 아니라 명령 루프의
+    격리까지 가야 한다.
+    """
+    existing = repo_two_stocks.load_config(1)
+    broker = FakeBroker([10_000], validate_account=True)
+    orch, (command_q, _, event_q) = _build(repo_two_stocks, broker)
+    command_q.put(_new(stock_code=existing.stock_code, label=existing.label))
+
+    await orch.drain_commands()
+
+    rejected = [e for e in _drain(event_q) if isinstance(e, ConfigRejected)]
+    assert len(rejected) == 1
+    assert existing.stock_code in rejected[0].detail
+    assert len(repo_two_stocks.list_configs()) == 2
+
+
+@pytest.mark.asyncio
+async def test_renaming_a_config_to_its_own_label_is_fine(repo_two_stocks):
+    """자기 이름으로 저장하는 것은 중복이 아니다.
+
+    이 예외를 빠뜨리면 사용자가 이름 말고 다른 값만 고칠 수 없다.
+    """
+    repo_two_stocks.set_config_status(1, "IDLE", at=AT)
+    existing = repo_two_stocks.load_config(1)
+    broker = FakeBroker([10_000], validate_account=True)
+    orch, (command_q, _, event_q) = _build(repo_two_stocks, broker)
+    command_q.put(_new(config_id=1, stock_code=existing.stock_code,
+                       label=existing.label, amount_per_stage=300_000))
+
+    await orch.drain_commands()
+
+    assert [e for e in _drain(event_q) if isinstance(e, ConfigSaved)]
+    assert repo_two_stocks.load_config(1).amount_per_stage == 300_000
