@@ -60,11 +60,14 @@ class OrderLogInvariantError(ValueError):
 class StageInvariantError(ValueError):
     """`save_stage` 갱신이 저장된 단계 이력의 불변식을 어길 때(Fix Round 4).
 
-    두 가지를 막는다: 이미 기록된 체결값(`fill_price`·`fill_qty`)을 다른
-    값으로 덮어쓰는 것, 도메인의 전이표(`domain.stage._ALLOWED`)가 허용하지
-    않는 상태 전이로 갱신하는 것. 도메인은 이 전이표를 `to_holding` 등
-    도우미를 거칠 때만 강제한다 — `StageState` 를 직접 만들어 넘기면
-    (이 프로젝트 이력에서 가장 흔한 결함 유형) 우회된다. `update_order_log`
+    세 가지를 막는다: 이미 기록된 `fill_price` 를 다른 값으로 덮어쓰는 것,
+    `fill_qty` 를 `SELL_PENDING → HOLDING` 축소(`cancel_sell`, 당일 유효한
+    매도 잔량의 마감 취소 — 이전 계획의 과매도 결함을 고친 경로) 이외의
+    방식으로 바꾸는 것(특히 어떤 전이에서든 증가시키는 것 — 과매도 방향),
+    도메인의 전이표(`domain.stage._ALLOWED`)가 허용하지 않는 상태 전이로
+    갱신하는 것. 도메인은 이 규칙들을 `to_holding`·`cancel_sell` 등
+    도우미를 거칠 때만 강제한다 — `StageState` 를 직접 만들어 넘기면(이
+    프로젝트 이력에서 가장 흔한 결함 유형) 우회된다. `update_order_log`
     가 `OrderLogInvariantError` 로 강화된 것과 같은 이유로, 저장소 경계가
     최종 방어선이 된다.
 
@@ -232,10 +235,12 @@ class RepositoryPort(Protocol):
         """(cycle_id, stage_no) 로 upsert 한다.
 
         같은 단계에 이미 저장된 행이 있으면 `StageInvariantError` 를 낸다:
-        이미 기록된 `fill_price`·`fill_qty` 를 다른 non-null 값으로
-        덮어쓰거나, 도메인 전이표가 허용하지 않는 상태로 옮기려 할 때.
-        같은 상태로의 재저장(매 틱의 정상 흐름)과 같은 값의 재확인은
-        허용한다.
+        이미 기록된 `fill_price` 를 다른 non-null 값으로 덮어쓰거나,
+        `fill_qty` 를 `SELL_PENDING → HOLDING` 축소(당일 유효한 매도 잔량의
+        마감 취소, `cancel_sell`) 이외의 방식으로 바꾸거나(특히 어떤
+        전이에서든 증가시키거나), 도메인 전이표가 허용하지 않는 상태로
+        옮기려 할 때. 같은 상태로의 재저장(매 틱의 정상 흐름)과 같은 값의
+        재확인은 허용한다.
         """
         ...
 

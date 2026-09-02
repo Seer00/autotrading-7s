@@ -157,16 +157,29 @@ class SqliteRepository:
     def save_stage(self, cycle_id: int, stage: StageState) -> None:
         """(cycle_id, stage_no) 로 upsert. 없는 행이면 그냥 만든다(초기 저장).
 
-        기존 행이 있으면 두 불변식을 지킨다(Fix Round 4 — `update_order_log`
+        기존 행이 있으면 세 불변식을 지킨다(Fix Round 4 — `update_order_log`
         와 같은 이유. `StageState` 는 직접 만들 수 있으므로, 도메인의
         전이표는 `to_holding` 등 도우미를 거칠 때만 강제되고 그 도우미를
         건너뛰면 우회된다 — 이 프로젝트 이력에서 가장 흔한 결함이 정확히
         그 우회였다):
 
-        1. **체결값 불변.** 저장된 `fill_price`·`fill_qty` 가 non-null 이고
-           새 값도 non-null 이며 서로 다르면 `StageInvariantError`. 같은
-           값의 재확인과 `None`(값 지움, `after_sell` 이 하는 일)은 허용한다.
-        2. **전이 합법성.** 저장된 상태와 새 상태가 다르면, 그 전이가
+        1. **`fill_price` 절대 불변.** 저장된 값이 non-null 이고 새 값도
+           non-null 이며 서로 다르면 `StageInvariantError`. 도메인의 다섯
+           전이 도우미(`to_holding`·`to_sell_pending`·`cancel_sell`·
+           `after_sell`·`cancel_buy`) 중 `fill_price` 를 바꾸는 것은 하나도
+           없다 — 처음 쓰거나(`to_holding`), 그대로 두거나, 지운다.
+        2. **`fill_qty` 는 `SELL_PENDING → HOLDING` 전이에서만, 그리고
+           내려가는 방향으로만 바뀔 수 있다.** `cancel_sell` 이 이 경로다 —
+           한국 주식 주문은 당일에만 유효하므로, 부분체결된 매도 주문의
+           미체결 잔량이 마감과 함께 취소되면 보유 수량이 줄어든 채
+           `HOLDING` 으로 돌아간다(`domain.stage.cancel_sell` 의 표현으로
+           "일상적인 경로"). 이 축소는 이전 계획의 결함(마감에 취소된
+           매도 잔량의 `fill_qty` 가 갱신되지 않아 과매도로 이어짐)의
+           수정이므로 이 메서드가 막으면 안 된다. 그 한 전이·그 방향
+           외에는 `fill_price` 와 같은 절대 불변 규칙이 적용된다 — 특히
+           **증가는 어느 전이에서도 거부한다**(과매도 방향이며, 보안
+           재검토가 처음 지목한 위험이 바로 이 방향이다).
+        3. **전이 합법성.** 저장된 상태와 새 상태가 다르면, 그 전이가
            `domain.stage._ALLOWED`(도메인이 이미 가진 표 — 여기서 다시
            베끼면 둘이 어긋날 수 있다)에 있어야 한다. 같은 상태로의
            재저장(매 틱의 정상 흐름)은 항상 허용한다.
@@ -198,15 +211,36 @@ class SqliteRepository:
                             f"{current_status.value} → {stage.status.value} "
                             "는 허용되지 않는 전이"
                         )
-                for field in ("fill_price", "fill_qty"):
-                    stored = current[field]
-                    incoming = getattr(stage, field)
-                    if (stored is not None and incoming is not None
-                            and stored != incoming):
+
+                stored_price = current["fill_price"]
+                incoming_price = stage.fill_price
+                if (stored_price is not None and incoming_price is not None
+                        and stored_price != incoming_price):
+                    raise StageInvariantError(
+                        f"stage {stage.stage_no} of cycle {cycle_id}: "
+                        f"fill_price already {stored_price!r}; refusing to "
+                        f"overwrite with {incoming_price!r}"
+                    )
+
+                stored_qty = current["fill_qty"]
+                incoming_qty = stage.fill_qty
+                if (stored_qty is not None and incoming_qty is not None
+                        and stored_qty != incoming_qty):
+                    # cancel_sell 의 잔량 취소 — 당일 유효한 매도 주문의
+                    # 미체결 잔량이 마감과 함께 취소되면 SELL_PENDING 에서
+                    # HOLDING 으로 돌아가되 보유 수량이 줄어든다. 이 한
+                    # 전이·이 방향만 예외다. 증가는(어느 전이에서든) 과매도
+                    # 방향이므로 항상 거부한다.
+                    is_the_sell_cancel_shrink = (
+                        current_status is StageStatus.SELL_PENDING
+                        and stage.status is StageStatus.HOLDING
+                        and 0 < incoming_qty < stored_qty
+                    )
+                    if not is_the_sell_cancel_shrink:
                         raise StageInvariantError(
                             f"stage {stage.stage_no} of cycle {cycle_id}: "
-                            f"{field} already {stored!r}; refusing to "
-                            f"overwrite with {incoming!r}"
+                            f"fill_qty already {stored_qty!r}; refusing to "
+                            f"overwrite with {incoming_qty!r}"
                         )
 
             self._conn.execute(
