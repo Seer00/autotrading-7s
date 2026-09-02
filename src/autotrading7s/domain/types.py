@@ -52,6 +52,13 @@ class CycleStatus(Enum):
 class CloseReason(Enum):
     NORMAL = "NORMAL"
     EMERGENCY = "EMERGENCY"
+    # D20 — 거래정지 등으로 정상 청산이 불가능해 잔량을 남긴 채 강제로 종료한
+    # 사이클. 스키마(설계서 12.1절, `cycle.close_reason` CHECK)가 이미 이 값을
+    # 허용하므로 매핑 계층(Plan 2A)이 저장된 행을 복원할 때 필요하다. 이 값을
+    # *만드는* 상태 전이(`force_close`)는 그것을 쓰는 Emergency Control
+    # Handler 와 함께 설계하기로 미뤄졌다(Plan 2B) — 이 멤버는 그 전이 없이도
+    # 이미 저장된 행을 왕복시키는 데 쓰인다.
+    FORCED = "FORCED"
 
 
 class FillState(Enum):
