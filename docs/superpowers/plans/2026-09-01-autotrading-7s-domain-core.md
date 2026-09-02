@@ -685,6 +685,43 @@ def test_rejects_invalid_drop_pct(drop: Decimal, stages: int):
         make_ladder(drop_pct=drop, max_stages=stages)
 
 
+def test_rejects_total_drop_exactly_one_boundary():
+    """total_drop == 1 경계도 거부한다 (`>=` 비교)."""
+    with pytest.raises(LadderConfigError):
+        make_ladder(drop_pct=Decimal("0.25"), max_stages=5)
+
+
+@pytest.mark.parametrize(
+    ("anchor", "drop", "stages", "amount"),
+    [
+        (3, Decimal("0.4"), 3, 3),                 # 마지막 단계 원시값 0.6
+        (10, Decimal("0.16"), 7, 1_000_000),       # 원시값 0.4
+        (1_000, Decimal("0.1666"), 7, 1_000_000),  # 원시값 0.4 — 현실적 가격대
+    ],
+)
+def test_rejects_last_stage_raw_price_below_one_won(
+    anchor: int, drop: Decimal, stages: int, amount: int
+):
+    """정규화 내림이 0을 만드는 설정은 생성 시점에 거부한다.
+
+    이 가드가 없으면 생성은 성공하고 trigger_price(마지막) 호출이 bare
+    ValueError 로 터진다 — 검증을 통과한 객체가 나중에 터지는 것이다.
+    """
+    with pytest.raises(LadderConfigError, match="below 1 won"):
+        make_ladder(anchor_price=anchor, drop_pct=drop, max_stages=stages,
+                    amount_per_stage=amount)
+
+
+def test_accepts_last_stage_raw_price_exactly_one_won():
+    """경계에서 거부 방향 off-by-one 이 없어야 한다.
+
+    anchor 10 × (1 - 0.15×6) = 10 × 0.10 = 1.0 → 정확히 1원.
+    """
+    ladder = make_ladder(anchor_price=10, drop_pct=Decimal("0.15"), max_stages=7,
+                         amount_per_stage=1_000_000)
+    assert ladder.trigger_price(7) == 1
+
+
 def test_rejects_nonpositive_amounts():
     with pytest.raises(LadderConfigError):
         make_ladder(amount_per_stage=0)
@@ -780,6 +817,23 @@ class Ladder:
             raise LadderConfigError(
                 f"drop_pct {self.drop_pct} × {self.max_stages - 1}단계 = {total_drop} "
                 "→ 마지막 단계 발동가가 0 이하가 된다"
+            )
+
+        # 마지막 단계의 원시 발동가(정규화 전)가 1원 이상이어야 한다.
+        # 위 total_drop 가드는 "수식이 음수가 아님"만 보장하는데, trigger_price 는
+        # normalize_tick 으로 내림하므로 원시값이 (0,1) 구간이면 0으로 내려가고
+        # tick_unit(0) 이 ValueError 를 던진다. 그러면 검증을 통과한 Ladder 가
+        # 호출 시점에 터진다. 원시값 ≥ 1 이면 그 가격대의 호가 단위가 1원이므로
+        # 내림 결과도 ≥ 1 이 보장된다. 발동가는 단계가 올라갈수록 낮아지므로
+        # 마지막 단계만 검사하면 충분하다.
+        last_raw = Decimal(self.anchor_price) * (
+            Decimal(1) - self.drop_pct * (self.max_stages - 1)
+        )
+        if last_raw < Decimal(1):
+            raise LadderConfigError(
+                f"last stage raw trigger price below 1 won: {last_raw} "
+                f"(anchor {self.anchor_price} × (1 - {self.drop_pct} × "
+                f"{self.max_stages - 1}))"
             )
 
         # 발동가는 단계가 올라갈수록 낮아지므로 1단계에서 1주를 살 수 있으면
@@ -1398,7 +1452,12 @@ class IllegalCycleTransition(RuntimeError):
 
 _ALLOWED: dict[CycleStatus, frozenset[CycleStatus]] = {
     CycleStatus.IDLE: frozenset({CycleStatus.STARTING}),
-    CycleStatus.STARTING: frozenset({CycleStatus.RUNNING, CycleStatus.IDLE}),
+    # STARTING → LIQUIDATING: 설계서 4.2절이 긴급청산을 "어느 상태에서든"으로
+    # 규정한다. STARTING 은 1단계 매수 주문이 체결 대기 중인 상태이며, 급락 중이라면
+    # 사용자가 가장 절실하게 빠져나오려는 순간이다.
+    CycleStatus.STARTING: frozenset(
+        {CycleStatus.RUNNING, CycleStatus.IDLE, CycleStatus.LIQUIDATING}
+    ),
     CycleStatus.RUNNING: frozenset(
         {CycleStatus.PAUSED, CycleStatus.LIQUIDATING, CycleStatus.CLOSED}
     ),
@@ -1423,6 +1482,41 @@ class Cycle:
     close_reason: CloseReason | None = None
     started_at: datetime | None = None
     closed_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        """앵커·사다리 불변식.
+
+        RUNNING·PAUSED 는 둘 다 필수다. RUNNING 은 사다리를 실제로 읽는 유일한
+        상태이고(accepts_triggers 가 그것으로 게이트), PAUSED 는 RUNNING 에서만
+        도달하므로 항상 사다리를 갖는다.
+
+        LIQUIDATING 은 필수가 아니다 — STARTING → LIQUIDATING 이 허용되므로 앵커
+        확정 전에 청산이 시작될 수 있다. 다만 앵커가 있으면 사다리도 있어야 하고
+        일치해야 한다.
+
+        일치 검사를 여기에 두는 이유는 confirm_anchor 의 호출부 검사만으로는
+        직접 생성(Plan 2 의 SQLite 행 복원)을 막지 못하기 때문이다.
+        """
+        if self.status in (CycleStatus.RUNNING, CycleStatus.PAUSED):
+            if self.anchor_price is None:
+                raise ValueError(
+                    f"Cycle status {self.status.value} requires anchor_price, got None"
+                )
+            if self.ladder is None:
+                raise ValueError(
+                    f"Cycle status {self.status.value} requires ladder, got None"
+                )
+        if self.anchor_price is not None and self.ladder is not None:
+            if self.anchor_price != self.ladder.anchor_price:
+                raise ValueError(
+                    f"anchor_price {self.anchor_price} != "
+                    f"ladder.anchor_price {self.ladder.anchor_price}"
+                )
+        if self.status is CycleStatus.LIQUIDATING and self.anchor_price is not None:
+            if self.ladder is None:
+                raise ValueError(
+                    "Cycle status LIQUIDATING with anchor_price requires ladder, got None"
+                )
 
     @property
     def is_active(self) -> bool:
@@ -1492,8 +1586,30 @@ def begin_liquidation(cycle: Cycle) -> Cycle:
     return replace(cycle, status=CycleStatus.LIQUIDATING)
 
 
-def close(cycle: Cycle, *, reason: CloseReason, at: datetime) -> Cycle:
+def close(
+    cycle: Cycle, *, reason: CloseReason, at: datetime, states: Sequence[StageState]
+) -> Cycle:
+    """사이클 종료. 보유가 남아 있으면 거부한다.
+
+    states 를 선택 인자로 두면 기본값이 "검사 없음"이 되어 안전장치가 아니다.
+    reason=EMERGENCY 에도 같은 검사를 적용한다 — 긴급청산이 부분 체결되면
+    (설계서 11절 result=PARTIAL) 보유가 남으므로 CLOSED 로 표시해서는 안 된다.
+    그러면 내부 기록과 실계좌가 갈라진다(설계서 10.2절).
+    """
     _guard(cycle, CycleStatus.CLOSED)
+    if not is_cycle_complete(states):
+        # 거부 사유를 구분한다. held_qty 는 PENDING 상태에서 0이므로, 사유가
+        # 미체결 주문일 때 수량만 말하면 "0주 보유 중"이라는 모순된 메시지가 된다.
+        pending = (StageStatus.BUY_PENDING, StageStatus.SELL_PENDING)
+        pending_stages = [s.stage_no for s in states if s.status in pending]
+        if pending_stages:
+            raise ValueError(
+                f"cannot close cycle — pending orders on stages: {pending_stages}"
+            )
+        held = sum(s.held_qty for s in states)
+        raise ValueError(
+            f"cannot close cycle with {held} shares still held — not all stages complete"
+        )
     return replace(cycle, status=CycleStatus.CLOSED, close_reason=reason, closed_at=at)
 
 
@@ -1502,7 +1618,14 @@ def is_cycle_complete(states: Sequence[StageState]) -> bool:
 
     설계서 4.2절은 '보유수량 0 도달'을 종료 조건으로 규정한다. PENDING 주문이
     남아 있으면 곧 보유가 생길 수 있으므로 종료로 보지 않는다.
+
+    빈 시퀀스는 데이터 정합성 실패다. all() 이 빈 시퀀스에서 True 를 반환하므로,
+    검사 없이 두면 단계 로드 실패가 "사이클 완료"로 번역되어 주식을 보유한
+    사이클이 닫힌다. False 반환은 문제를 숨긴 채 사이클을 영구히 미완료로
+    남기므로, 조용한 정지보다 시끄러운 오류를 택한다.
     """
+    if not states:
+        raise ValueError("stage states sequence is empty — data integrity failure")
     pending = (StageStatus.BUY_PENDING, StageStatus.SELL_PENDING)
     if any(s.status in pending for s in states):
         return False
@@ -1812,7 +1935,8 @@ def tick(price: int, source: TickSource = TickSource.WS) -> Tick:
 
 def run(price: int, states, cycle=None, market_open=True, now=T0, params=PARAMS):
     return decide(tick=tick(price), cycle=cycle or running_cycle(),
-                  states=states, params=params, now=now, market_open=market_open)
+                  states=states, params=params, now=now, market_open=market_open,
+                  stock_code="005930")
 
 
 def test_buys_next_stage_when_trigger_reached():
@@ -2067,7 +2191,7 @@ git commit -m "feat: 매수 트리거 판정 추가 (규칙 2·4·5)
 
 **Interfaces:**
 - Consumes: `target_price` (태스크 3), `BuyStage`·`SellStage`·`decide` (태스크 7)
-- Produces: `decide()` 가 `SellStage` 를 반환할 수 있게 확장. 시그니처 변경 없음
+- Produces: `decide()` 가 `SellStage` 를 반환할 수 있게 확장. 시그니처는 Task 7 수정 라운드에서 `stock_code: str` 필수 키워드가 추가된 형태이며 이 태스크에서 더 변경하지 않는다
 
 **설계서 모호성 해소:** 설계서 규칙 1은 "매도 먼저 집행"이라고만 적혀 있어 같은 틱에 매도와 매수를 함께 반환할지가 불명확하다. **매도가 하나라도 있으면 그 틱에서는 매도만 반환한다**로 확정한다. 근거는 두 가지다. ① 규칙 1의 목적이 "예수금 확보 후 매수"인데, 같은 틱에 둘을 함께 내면 매도 대금이 들어오기 전에 매수가 나간다. ② 규칙 2의 "한 틱에 하나씩" 철학과 일관된다. 틱 간격이 통상 1초 미만이라 매수는 다음 틱에 평가되므로 실질 지연이 없다.
 
@@ -2114,7 +2238,7 @@ def stage(lad: Ladder, no: int, status: StageStatus,
 def run(price: int, states, lad: Ladder, params=PARAMS, now=T0):
     return decide(tick=Tick(code="005930", price=price, at=T0, source=TickSource.WS),
                   cycle=running_cycle(lad), states=states, params=params,
-                  now=now, market_open=True)
+                  now=now, market_open=True, stock_code="005930")
 
 
 def test_sells_when_target_reached():
@@ -2353,7 +2477,7 @@ def sold_then_waiting(lad: Ladder, no: int, sold_at: datetime) -> StageState:
 def run(price: int, states, lad: Ladder, params: TriggerParams, now: datetime):
     return decide(tick=Tick(code="005930", price=price, at=now, source=TickSource.WS),
                   cycle=running_cycle(lad), states=states, params=params,
-                  now=now, market_open=True)
+                  now=now, market_open=True, stock_code="005930")
 
 
 @pytest.mark.parametrize(
@@ -2938,6 +3062,7 @@ def test_full_cycle_down_then_up_closes_at_zero_holdings():
                       source=TickSource.WS),
             cycle=cycle, states=states, params=params,
             now=clock.now(), market_open=clock.is_market_open(),
+            stock_code="005930",
         )
         for d in decisions:
             ctx = GuardContext(
@@ -2982,7 +3107,7 @@ def test_full_cycle_down_then_up_closes_at_zero_holdings():
     assert held_qty(states) == 0
     assert is_cycle_complete(states) is True
 
-    closed = close(cycle, reason=CloseReason.NORMAL, at=clock.now())
+    closed = close(cycle, reason=CloseReason.NORMAL, at=clock.now(), states=states)
     assert closed.status is CycleStatus.CLOSED
     assert closed.close_reason is CloseReason.NORMAL
     assert orders == 7, "매수 3건 + 매도 4건"
@@ -3005,6 +3130,7 @@ def test_no_activity_outside_market_hours():
                       source=TickSource.WS),
             cycle=cycle, states=states, params=TriggerParams(target_pct=FIVE),
             now=clock.now(), market_open=clock.is_market_open(),
+            stock_code="005930",
         ) == []
 
 
@@ -3021,7 +3147,7 @@ def test_total_limit_stops_further_buys():
     decisions = decide(
         tick=Tick(code="005930", price=9_500, at=T0, source=TickSource.WS),
         cycle=cycle, states=states, params=TriggerParams(target_pct=FIVE),
-        now=T0, market_open=True,
+        now=T0, market_open=True, stock_code="005930",
     )
     assert len(decisions) == 1
     ctx = GuardContext(stock_invested=6_900_000, stock_limit=7_000_000,
@@ -3071,6 +3197,21 @@ def test_domain_imports_nothing_external():
 계산값이 10원 배수가 아닌 4·2단계는 올림 때문에 목표가가 5원 올라간다. 틱 시퀀스를 각 단계의 목표가에 정확히 맞춰 두었으므로 매 틱에 한 단계씩만 매도되며, `sold_order` 는 `[4, 3, 2, 1]` 이 된다.
 
 이 표는 호가 단위 정규화가 왜 목표가 계산에 반드시 들어가야 하는지 보여준다. 정규화가 없으면 8,925원에 매도 주문이 나가고 거부된다.
+
+> **Task 5 실행 중 확정된 계약 변경** (계획서 작성 시점에는 없었음):
+> - `close(cycle, *, reason, at, states)` — `states` 가 **필수** 키워드 인자다.
+>   보유가 남아 있거나 미체결 주문이 있으면 `ValueError` 로 거부한다. 안전장치를
+>   선택 인자로 두면 기본값이 "검사 없음"이 되므로 필수로 했다.
+> - `is_cycle_complete(states)` 는 빈 시퀀스에 `ValueError` 를 던진다. 사이클은
+>   항상 `max_stages` 개의 단계를 가지므로 빈 목록은 데이터 정합성 실패다.
+> - `Cycle.__post_init__` 이 `RUNNING`·`PAUSED` 에서 `anchor_price` 와 `ladder` 를
+>   요구한다. `LIQUIDATING` 은 맨몸 생성을 허용하되 앵커가 있으면 사다리 일치를
+>   검사한다(긴급청산이 `STARTING` 에서도 시작될 수 있으므로).
+> - `StageState.__post_init__` 이 `HOLDING`·`SELL_PENDING` 에서 `fill_price` 와
+>   `fill_qty` 를 요구한다.
+> - `_ALLOWED[STARTING]` 에 `LIQUIDATING` 이 포함된다(설계서 4.2절 "어느
+>   상태에서든"). `LIQUIDATING` 에서 나가는 경로는 `CLOSED` 하나뿐이다 — 청산
+>   의도가 보존되어야 하므로 일방향 래칫이다.
 
 - [ ] **Step 6: G1 게이트 실행 — 전체 테스트와 커버리지**
 
@@ -3153,6 +3294,8 @@ Plan 1 완료 시 다음이 모두 통과해야 한다.
 - [ ] 규칙 5 — PENDING 제외
 - [ ] 단계 상태 전이 전수 + 불법 전이 거부
 - [ ] 사이클 상태 전이 전수 + 불법 전이 거부
+- [ ] 사이클 안전장치 — 앵커·사다리 불변식, 빈 단계 목록 거부, 보유 중 종료 거부, 긴급청산이 STARTING 에서도 가능, LIQUIDATING 일방향 래칫
+- [ ] 사다리 설정 검증 — 마지막 단계 원시 발동가 1원 하한(양방향 경계), total_drop == 1 경계
 - [ ] guards 전항목 — 한도 경계값, 1주 미달, 빈도 제한
 - [ ] 평가·실현손익 계산 (설계서 14.1절 목업 수치 고정)
 - [ ] `domain/` 의존 규칙 자동 검증

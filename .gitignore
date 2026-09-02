@@ -17,3 +17,10 @@ logs/
 
 # 세션 히스토리 (도구가 관리)
 .remember/
+
+# SDD 워크스페이스 (스크래치)
+.superpowers/
+
+# 커버리지 산출물
+.coverage
+htmlcov/
