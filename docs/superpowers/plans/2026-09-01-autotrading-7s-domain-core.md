@@ -3036,7 +3036,7 @@ def test_full_cycle_down_then_up_closes_at_zero_holdings():
     assert held_qty(states) == 0
     assert is_cycle_complete(states) is True
 
-    closed = close(cycle, reason=CloseReason.NORMAL, at=clock.now())
+    closed = close(cycle, reason=CloseReason.NORMAL, at=clock.now(), states=states)
     assert closed.status is CycleStatus.CLOSED
     assert closed.close_reason is CloseReason.NORMAL
     assert orders == 7, "매수 3건 + 매도 4건"
@@ -3125,6 +3125,21 @@ def test_domain_imports_nothing_external():
 계산값이 10원 배수가 아닌 4·2단계는 올림 때문에 목표가가 5원 올라간다. 틱 시퀀스를 각 단계의 목표가에 정확히 맞춰 두었으므로 매 틱에 한 단계씩만 매도되며, `sold_order` 는 `[4, 3, 2, 1]` 이 된다.
 
 이 표는 호가 단위 정규화가 왜 목표가 계산에 반드시 들어가야 하는지 보여준다. 정규화가 없으면 8,925원에 매도 주문이 나가고 거부된다.
+
+> **Task 5 실행 중 확정된 계약 변경** (계획서 작성 시점에는 없었음):
+> - `close(cycle, *, reason, at, states)` — `states` 가 **필수** 키워드 인자다.
+>   보유가 남아 있거나 미체결 주문이 있으면 `ValueError` 로 거부한다. 안전장치를
+>   선택 인자로 두면 기본값이 "검사 없음"이 되므로 필수로 했다.
+> - `is_cycle_complete(states)` 는 빈 시퀀스에 `ValueError` 를 던진다. 사이클은
+>   항상 `max_stages` 개의 단계를 가지므로 빈 목록은 데이터 정합성 실패다.
+> - `Cycle.__post_init__` 이 `RUNNING`·`PAUSED` 에서 `anchor_price` 와 `ladder` 를
+>   요구한다. `LIQUIDATING` 은 맨몸 생성을 허용하되 앵커가 있으면 사다리 일치를
+>   검사한다(긴급청산이 `STARTING` 에서도 시작될 수 있으므로).
+> - `StageState.__post_init__` 이 `HOLDING`·`SELL_PENDING` 에서 `fill_price` 와
+>   `fill_qty` 를 요구한다.
+> - `_ALLOWED[STARTING]` 에 `LIQUIDATING` 이 포함된다(설계서 4.2절 "어느
+>   상태에서든"). `LIQUIDATING` 에서 나가는 경로는 `CLOSED` 하나뿐이다 — 청산
+>   의도가 보존되어야 하므로 일방향 래칫이다.
 
 - [ ] **Step 6: G1 게이트 실행 — 전체 테스트와 커버리지**
 
