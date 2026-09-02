@@ -37,10 +37,10 @@ def holding(lad: Ladder, n: int, fill: int, qty: int) -> StageState:
                       fill_price=fill, fill_qty=qty, bought_at=T0)
 
 
-def complete_rows(lad: Ladder, *, id_base: int = 1) -> list[dict]:
+def complete_rows(lad: Ladder) -> list[dict]:
     rows = []
     for n in range(1, lad.max_stages + 1):
-        rows.append(stage_to_row(1, waiting(lad, n)) | {"id": id_base + n - 1})
+        rows.append(stage_to_row(1, waiting(lad, n)) | {"id": n})
     return rows
 
 
@@ -89,6 +89,19 @@ def test_row_to_stage_refuses_a_naive_timestamp():
         row_to_stage(row)
 
 
+def test_row_to_stage_lets_a_non_str_bought_at_raise_typeerror():
+    """감싸지 않는 절반을 고정한다. `except ValueError` 를
+    `except (ValueError, TypeError)` 로 넓히면(Task 6 에서 이미 한 번 벌어진
+    실수) 이 테스트가 잡아야 한다 — 비문자열 시각은 호출자 버그이며 그대로
+    올라와야 한다."""
+    lad = a_ladder()
+    row = stage_to_row(1, holding(lad, 3, 8_950, 111)) | {
+        "id": 3, "bought_at": 12345
+    }
+    with pytest.raises(TypeError):
+        row_to_stage(row)
+
+
 # ── H3: 완전한 단계 집합 ──────────────────────────────────────────────────
 
 def test_complete_set_is_accepted():
@@ -119,7 +132,7 @@ def test_the_error_names_the_missing_stage():
     rows = [r for r in complete_rows(lad) if r["stage_no"] != 4]
     with pytest.raises(CorruptRowError) as exc:
         rows_to_stages(rows, cycle_id=1, ladder=lad)
-    assert "4" in str(exc.value)
+    assert "missing [4]" in str(exc.value)
 
 
 def test_a_duplicate_stage_row_is_refused():
@@ -140,7 +153,7 @@ def test_an_out_of_range_stage_row_is_refused():
          "fill_qty": None, "bought_at": None, "last_sold_at": None,
          "rebuy_count": 0}
     )
-    with pytest.raises(CorruptRowError):
+    with pytest.raises(CorruptRowError, match="unexpected"):
         rows_to_stages(rows, cycle_id=1, ladder=lad)
 
 
@@ -148,6 +161,27 @@ def test_an_empty_row_list_is_refused():
     lad = a_ladder()
     with pytest.raises(CorruptRowError, match="incomplete"):
         rows_to_stages([], cycle_id=1, ladder=lad)
+
+
+def test_a_foreign_cycle_row_is_refused():
+    """cycle_id 대조. `UNIQUE(cycle_id, stage_no)` 는 같은 사이클 안의 중복만
+    막는다 — 다른 사이클의 행이 섞여 들어오는 것은 스키마로 막히지 않으므로
+    이 함수가 대조해야 한다."""
+    lad = a_ladder()
+    rows = complete_rows(lad)
+    rows[4] = rows[4] | {"cycle_id": 99}
+    with pytest.raises(CorruptRowError) as exc:
+        rows_to_stages(rows, cycle_id=1, ladder=lad)
+    message = str(exc.value)
+    assert "cycle 99" in message
+    assert "cycle 1" in message
+
+
+def test_a_uniform_cycle_id_set_is_still_accepted():
+    """cycle_id 대조의 반대 절반 — 모두 같은 cycle_id 면 통과해야 한다."""
+    lad = a_ladder()
+    stages = rows_to_stages(complete_rows(lad), cycle_id=1, ladder=lad)
+    assert [s.stage_no for s in stages] == [1, 2, 3, 4, 5, 6, 7]
 
 
 # ── H4: trigger_price 대조 ────────────────────────────────────────────────

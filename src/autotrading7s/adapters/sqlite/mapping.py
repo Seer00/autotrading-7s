@@ -5,8 +5,10 @@ H3(완전한 단계 집합), H4(trigger_price 대조). H2(tz-aware)는 codec 이
 
 **감싸는 것과 감싸지 않는 것.** 도메인 객체를 복원하다 `DomainInvariantError` 가
 나면 그것은 그 행이 손상된 것이므로 `CorruptRowError` 로 감싸 테이블과 rowid 를
-붙인다. `ValueError`·`TypeError` 는 호출자 버그이므로 감싸지 않고 그대로 올린다 —
-개발 중에 드러나야 한다. Task 1 이 두 범주를 나눈 목적이 이 구분이다.
+붙인다. `TypeError` 는 호출자 버그이므로 감싸지 않고 그대로 올린다 — 개발 중에
+드러나야 한다. 저장된 값을 해석하는 도중 나는 `ValueError`(예: 알 수 없는 enum
+값) 도 행 손상이므로 감싼다 — `DomainInvariantError` 는 `ValueError` 의 하위라서
+`except ValueError` 가 둘 다 잡는다. Task 1 이 이 구분을 만들었다.
 """
 
 from __future__ import annotations
@@ -231,6 +233,11 @@ def rows_to_stages(
     반환 순서는 항상 `stage_no` 오름차순이다. DB 가 `ORDER BY` 없이 주더라도
     호출부가 순서에 의존할 수 있어야 한다.
 
+    **cycle_id 대조.** `UNIQUE(cycle_id, stage_no)` 는 같은 사이클 안의 중복만
+    막는다 — 다른 사이클의 행이 이 사이클로 섞여 들어오는 것은 스키마로 막히지
+    않는다. 의도한 경로(`WHERE cycle_id = ?`)는 이 오염을 만들 수 없지만, 직접
+    생성은 그 경로를 우회할 수 있으므로 여기서도 확인한다.
+
     빈 목록 처리: `ladder` 가 없고 `rows` 도 비면 `expected` 와 `actual` 이 둘 다
     빈 집합이 되어 통과해버린다. 이 경로를 특별히 막지 않는다 — 사이클이
     있으면 단계도 있으므로 `ladder` 없이 빈 목록을 넘기는 호출부는 없다.
@@ -238,12 +245,22 @@ def rows_to_stages(
     stages = [row_to_stage(row) for row in rows]
 
     seen: dict[int, StageState] = {}
-    for stage in stages:
+    id_by_stage_no: dict[int, object] = {}
+    for row, stage in zip(rows, stages):
+        row_id = row.get("id")
+        row_cycle_id = row["cycle_id"]
+        if row_cycle_id != cycle_id:
+            raise CorruptRowError(
+                f"stage_state (id={row_id}) belongs to cycle {row_cycle_id}, "
+                f"not cycle {cycle_id}"
+            )
         if stage.stage_no in seen:
             raise CorruptRowError(
-                f"duplicate stage_no {stage.stage_no} in cycle {cycle_id}"
+                f"duplicate stage_no {stage.stage_no} in stage_state "
+                f"(id={row_id}) for cycle {cycle_id}"
             )
         seen[stage.stage_no] = stage
+        id_by_stage_no[stage.stage_no] = row_id
 
     if ladder is not None:
         expected = set(range(1, ladder.max_stages + 1))
@@ -254,9 +271,10 @@ def rows_to_stages(
     if actual != expected:
         missing = sorted(expected - actual)
         extra = sorted(actual - expected)
+        extra_ids = [id_by_stage_no[n] for n in extra]
         raise CorruptRowError(
-            f"incomplete stage set for cycle {cycle_id}: "
-            f"missing {missing}, unexpected {extra}"
+            f"incomplete stage_state set for cycle {cycle_id}: "
+            f"missing {missing}, unexpected {extra} (id={extra_ids})"
         )
 
     if ladder is not None:
@@ -265,9 +283,10 @@ def rows_to_stages(
             expected_trigger = ladder.trigger_price(stage_no)
             if stage.trigger_price != expected_trigger:
                 raise CorruptRowError(
-                    f"trigger_price mismatch on stage {stage_no} of cycle "
-                    f"{cycle_id}: row has {stage.trigger_price}, ladder computes "
-                    f"{expected_trigger}"
+                    f"trigger_price mismatch in stage_state (id="
+                    f"{id_by_stage_no[stage_no]}) stage {stage_no} of cycle "
+                    f"{cycle_id}: row has {stage.trigger_price}, ladder "
+                    f"computes {expected_trigger}"
                 )
 
     return [seen[n] for n in sorted(seen)]
