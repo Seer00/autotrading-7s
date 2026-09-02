@@ -79,12 +79,10 @@ def test_abort_start_returns_to_idle():
      CycleStatus.LIQUIDATING, CycleStatus.CLOSED],
 )
 def test_only_running_accepts_triggers(status: CycleStatus):
-    if status in (CycleStatus.PAUSED, CycleStatus.LIQUIDATING):
-        # FINDING A: PAUSED와 LIQUIDATING은 anchor_price와 ladder가 필수
-        cyc = Cycle(cycle_id=1, config_id=1, seq=1, status=status,
-                    anchor_price=10_000, ladder=ladder())
-    else:
-        cyc = Cycle(cycle_id=1, config_id=1, seq=1, status=status)
+    """FINDING F3: 모든 non-RUNNING 상태는 유효한 anchor/ladder가 있어도 triggers를 거부한다."""
+    # FINDING F3: 모든 상태에 anchor와 ladder를 제공하여 stronger assertion
+    cyc = Cycle(cycle_id=1, config_id=1, seq=1, status=status,
+                anchor_price=10_000, ladder=ladder())
     assert cyc.accepts_triggers is False
 
 
@@ -131,7 +129,6 @@ def test_paused_can_be_closed():
         (CycleStatus.IDLE, "begin_liquidation"),
         (CycleStatus.RUNNING, "start"),
         (CycleStatus.RUNNING, "resume"),
-        (CycleStatus.LIQUIDATING, "pause"),
         (CycleStatus.LIQUIDATING, "resume"),
         (CycleStatus.CLOSED, "start"),
         (CycleStatus.CLOSED, "pause"),
@@ -139,7 +136,9 @@ def test_paused_can_be_closed():
     ],
 )
 def test_illegal_cycle_transitions(status: CycleStatus, action: str):
-    """FINDING A: RUNNING과 LIQUIDATING 상태는 anchor_price와 ladder가 필수."""
+    """FINDING A: RUNNING과 LIQUIDATING 상태는 anchor_price와 ladder가 필수.
+    FINDING F1: LIQUIDATING에서 pause()는 이제 허용된다 (LIQUIDATING → PAUSED).
+    """
     if status in (CycleStatus.RUNNING, CycleStatus.LIQUIDATING):
         cyc = Cycle(cycle_id=1, config_id=1, seq=1, status=status,
                     anchor_price=10_000, ladder=ladder())
@@ -194,18 +193,32 @@ def test_cycle_running_requires_ladder():
               anchor_price=10_000)
 
 
-def test_cycle_paused_requires_anchor_price():
-    """FINDING A: PAUSED 상태는 anchor_price가 필수."""
-    with pytest.raises(ValueError, match="requires anchor_price"):
-        Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.PAUSED,
-              ladder=ladder())
+def test_cycle_running_anchor_ladder_must_match():
+    """FINDING A: RUNNING의 anchor_price와 ladder.anchor_price가 일치해야 한다."""
+    with pytest.raises(ValueError, match="anchor_price .* != ladder.anchor_price"):
+        Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.RUNNING,
+              anchor_price=9_000, ladder=ladder(anchor=10_000))
 
 
-def test_cycle_paused_requires_ladder():
-    """FINDING A: PAUSED 상태는 ladder가 필수."""
+def test_cycle_paused_allows_no_fields():
+    """FINDING F2: PAUSED는 anchor/ladder 없이도 가능 (부분 청산 후 탈출 경로)."""
+    cyc = Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.PAUSED)
+    assert cyc.anchor_price is None
+    assert cyc.ladder is None
+
+
+def test_cycle_paused_with_anchor_requires_matching_ladder():
+    """FINDING F2: PAUSED가 anchor_price를 가지면 ladder도 필수이고 일치해야 한다."""
     with pytest.raises(ValueError, match="requires ladder"):
         Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.PAUSED,
               anchor_price=10_000)
+
+
+def test_cycle_paused_anchor_ladder_mismatch():
+    """FINDING F2: PAUSED에서도 anchor/ladder 미스매치는 거부된다."""
+    with pytest.raises(ValueError, match="anchor_price .* != ladder.anchor_price"):
+        Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.PAUSED,
+              anchor_price=9_340, ladder=ladder(anchor=10_000))
 
 
 def test_cycle_liquidating_from_starting_allows_no_fields():
@@ -220,13 +233,6 @@ def test_cycle_liquidating_with_anchor_requires_matching_ladder():
     with pytest.raises(ValueError, match="requires ladder"):
         Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.LIQUIDATING,
               anchor_price=10_000)
-
-
-def test_cycle_anchor_mismatch():
-    """FINDING A: anchor_price와 ladder.anchor_price가 일치해야 한다."""
-    with pytest.raises(ValueError, match="anchor_price .* != ladder.anchor_price"):
-        Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.RUNNING,
-              anchor_price=9_000, ladder=ladder(anchor=10_000))
 
 
 def test_cycle_idle_allows_no_fields():
@@ -267,9 +273,9 @@ def test_close_emergency_also_checks_holdings():
 
 
 def test_close_with_pending_orders_fails():
-    """FINDING C: PENDING 주문이 있으면 사이클을 종료할 수 없다."""
+    """FINDING F4: PENDING 주문이 있으면 사이클을 종료할 수 없다."""
     incomplete_states = [_stage(1, StageStatus.SOLD), _stage(2, StageStatus.BUY_PENDING)]
-    with pytest.raises(ValueError, match="shares still held"):
+    with pytest.raises(ValueError, match="pending orders"):
         close(running(), reason=CloseReason.NORMAL, at=T0, states=incomplete_states)
 
 
@@ -298,6 +304,86 @@ def test_begin_liquidation_still_refuses_closed():
 
 def test_begin_liquidation_still_refuses_from_liquidating():
     """FINDING D: 긴급청산은 LIQUIDATING에서 거부된다 (이중 요청 방지)."""
+    cyc = Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.LIQUIDATING,
+                anchor_price=10_000, ladder=ladder())
+    with pytest.raises(IllegalCycleTransition):
+        begin_liquidation(cyc)
+
+
+# FINDING F1: partial liquidation escape route tests
+def test_liquidating_can_transition_to_paused():
+    """FINDING F1: LIQUIDATING에서 PAUSED로 전이하여 부분 청산 후 탈출."""
+    liq_cyc = begin_liquidation(running())
+    assert liq_cyc.status is CycleStatus.LIQUIDATING
+    # PAUSED로의 전이를 통해 부분 청산된 포지션 관리 가능
+    paused_cyc = pause(liq_cyc)
+    assert paused_cyc.status is CycleStatus.PAUSED
+
+
+def test_partial_liquidation_escape_path():
+    """FINDING F1: RUNNING → LIQUIDATING → PAUSED → LIQUIDATING (retry) → CLOSED 경로."""
+    # 1단계: RUNNING 상태에서 긴급청산
+    cyc = running()
+    liq_cyc = begin_liquidation(cyc)
+    assert liq_cyc.status is CycleStatus.LIQUIDATING
+
+    # 2단계: 부분 청산 후 PAUSED로 전이하여 위치 관리
+    paused_cyc = pause(liq_cyc)
+    assert paused_cyc.status is CycleStatus.PAUSED
+
+    # 3단계: 필요하면 다시 LIQUIDATING 재시도
+    liq_cyc2 = begin_liquidation(paused_cyc)
+    assert liq_cyc2.status is CycleStatus.LIQUIDATING
+
+    # 4단계: 최종 완료 후 CLOSED
+    cyc_closed = close(liq_cyc2, reason=CloseReason.EMERGENCY, at=T0,
+                       states=complete_stages())
+    assert cyc_closed.status is CycleStatus.CLOSED
+
+
+# FINDING F2: STARTING → LIQUIDATING → PAUSED without anchor/ladder tests
+def test_starting_liquidating_paused_escape_no_anchor():
+    """FINDING F2: STARTING에서 LIQUIDATING을 거쳐 PAUSED로 가는 경로 (anchor 없음)."""
+    # 1단계: STARTING 상태 (1단계 주문 비행 중)
+    cyc = start(idle(), at=T0)
+    assert cyc.status is CycleStatus.STARTING
+    assert cyc.anchor_price is None
+
+    # 2단계: 사용자 긴급 취소로 LIQUIDATING
+    liq_cyc = begin_liquidation(cyc)
+    assert liq_cyc.status is CycleStatus.LIQUIDATING
+    assert liq_cyc.anchor_price is None
+
+    # 3단계: PAUSED로 전이 가능 (F2: PAUSED가 조건부 필드 검사)
+    paused_cyc = pause(liq_cyc)
+    assert paused_cyc.status is CycleStatus.PAUSED
+    assert paused_cyc.anchor_price is None
+
+
+def test_liquidating_running_to_paused_retains_holdings():
+    """FINDING F1: 긴급청산 후 PAUSED로의 전이가 보유 정보를 유지한다."""
+    cyc = running()
+    liq_cyc = begin_liquidation(cyc)
+
+    # 보유 정보는 사이클이 아닌 stages에 있으므로, pause 후에도 stages 유지 가능
+    paused_cyc = pause(liq_cyc)
+    assert paused_cyc.status is CycleStatus.PAUSED
+    assert paused_cyc.anchor_price == cyc.anchor_price  # Anchor 유지
+    assert paused_cyc.ladder == cyc.ladder  # Ladder 유지
+
+
+def test_liquidating_running_to_paused_refuses_resume_directly():
+    """FINDING F1: LIQUIDATING → PAUSED 후 RESUME은 불가능 (PAUSED → RUNNING은 허용)."""
+    cyc = begin_liquidation(running())
+    paused_cyc = pause(cyc)
+
+    # PAUSED → RUNNING은 허용됨
+    resumed = resume(paused_cyc)
+    assert resumed.status is CycleStatus.RUNNING
+
+
+def test_liquidating_refuses_liquidating():
+    """FINDING F1: LIQUIDATING에서 idempotent 재발급 거부 (LIQUIDATING → LIQUIDATING 불허)."""
     cyc = Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.LIQUIDATING,
                 anchor_price=10_000, ladder=ladder())
     with pytest.raises(IllegalCycleTransition):

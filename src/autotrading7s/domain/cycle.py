@@ -31,7 +31,7 @@ _ALLOWED: dict[CycleStatus, frozenset[CycleStatus]] = {
     CycleStatus.PAUSED: frozenset(
         {CycleStatus.RUNNING, CycleStatus.LIQUIDATING, CycleStatus.CLOSED}
     ),
-    CycleStatus.LIQUIDATING: frozenset({CycleStatus.CLOSED}),
+    CycleStatus.LIQUIDATING: frozenset({CycleStatus.CLOSED, CycleStatus.PAUSED}),
     CycleStatus.CLOSED: frozenset(),
 }
 
@@ -50,10 +50,12 @@ class Cycle:
 
     def __post_init__(self) -> None:
         # FINDING A: 상태별 필드 불변량 검사.
-        # RUNNING, PAUSED 상태는 앵커와 사다리가 반드시 필요하다.
-        # LIQUIDATING은 STARTING에서도 들어올 수 있으므로 (사용자 긴급 취소),
-        # 앵커가 있을 때만 검사한다.
-        if self.status in (CycleStatus.RUNNING, CycleStatus.PAUSED):
+        # RUNNING 상태만 앵커와 사다리가 반드시 필요하다. 트리거를 평가하는 유일한 상태.
+        # PAUSED, LIQUIDATING은 각각 RUNNING/STARTING에서 들어올 수 있으므로,
+        # 앵커가 있을 때만 검사한다. FINDING F2: 부분 청산(F1) 후 PAUSED로의 탈출을
+        # 위해 필드 없이 들어올 수 있어야 함.
+        if self.status is CycleStatus.RUNNING:
+            # RUNNING은 strict: 트리거 평가에서 ladder를 읽으므로 반드시 필요
             if self.anchor_price is None:
                 raise ValueError(
                     f"Cycle status {self.status.value} requires anchor_price, got None"
@@ -66,16 +68,18 @@ class Cycle:
                 raise ValueError(
                     f"anchor_price {self.anchor_price} != ladder.anchor_price {self.ladder.anchor_price}"
                 )
-        elif self.status is CycleStatus.LIQUIDATING and self.anchor_price is not None:
-            # LIQUIDATING에 anchor_price가 있으면 ladder도 있어야 하고 일치해야 한다
-            if self.ladder is None:
-                raise ValueError(
-                    f"Cycle status LIQUIDATING with anchor_price requires ladder, got None"
-                )
-            if self.anchor_price != self.ladder.anchor_price:
-                raise ValueError(
-                    f"anchor_price {self.anchor_price} != ladder.anchor_price {self.ladder.anchor_price}"
-                )
+        elif self.status in (CycleStatus.PAUSED, CycleStatus.LIQUIDATING):
+            # PAUSED, LIQUIDATING: 앵커가 있으면 ladder도 필요하고 일치해야 한다.
+            # 앵커 없이도 가능 (STARTING→LIQUIDATING→PAUSED 경로)
+            if self.anchor_price is not None:
+                if self.ladder is None:
+                    raise ValueError(
+                        f"Cycle status {self.status.value} with anchor_price requires ladder, got None"
+                    )
+                if self.anchor_price != self.ladder.anchor_price:
+                    raise ValueError(
+                        f"anchor_price {self.anchor_price} != ladder.anchor_price {self.ladder.anchor_price}"
+                    )
 
     @property
     def is_active(self) -> bool:
@@ -151,6 +155,13 @@ def close(
     """사이클을 종료 상태로 전이. FINDING C: 사이클이 실제로 종료되었음을 검증."""
     _guard(cycle, CycleStatus.CLOSED)
     if not is_cycle_complete(states):
+        # FINDING F4: PENDING 주문과 보유 주식을 구분하여 메시지 작성
+        pending = (StageStatus.BUY_PENDING, StageStatus.SELL_PENDING)
+        pending_stages = [s.stage_no for s in states if s.status in pending]
+        if pending_stages:
+            raise ValueError(
+                f"cannot close cycle — pending orders on stages: {pending_stages}"
+            )
         held = sum(s.held_qty for s in states)
         raise ValueError(
             f"cannot close cycle with {held} shares still held — not all stages complete"
