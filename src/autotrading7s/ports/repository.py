@@ -21,6 +21,29 @@ from autotrading7s.domain.stage import StageState
 from autotrading7s.domain.types import CloseReason, CycleStatus, OrderPath, Side
 
 
+class OrderLogNotFound(LookupError):
+    """`update_order_log` 이 존재하지 않는 `client_ref` 를 갱신하려 할 때.
+
+    조용히 아무 일도 하지 않으면 호출자는 브로커 응답이 기록됐다고 믿지만
+    DB 는 영영 다른 상태로 남는다. `LookupError` 를 상속한다 — `ValueError`
+    도 `TypeError` 도 아니므로 매핑 계층의 wrap/no-wrap 구분과 부딪치지
+    않는다(매핑 계층은 이 예외를 보지 않는다: `update_order_log` 는 행을
+    도메인 객체로 복원하지 않는다).
+    """
+
+
+class OrderLogInvariantError(ValueError):
+    """`update_order_log` 갱신이 주문 이력 자체의 불변식을 어길 때.
+
+    세 가지를 막는다: 종결 상태(`FILLED`·`CANCELED`·`REJECTED`)에서 다른
+    상태로의 역행, 이미 기록된 체결값(`fill_price`·`fill_qty`)을 다른 값으로
+    덮어쓰는 것, `fill_qty` 가 `req_qty` 를 넘는 것.
+
+    `DomainInvariantError` 를 상속하지 않는다 — `order_log` 는 도메인
+    객체가 아니라 저장 형태이므로, 이 예외는 그 계층과 별개다.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class SplitConfig:
     """분할 설정 — 설계서 12.1절 `split_config`.
@@ -128,7 +151,13 @@ class RepositoryPort(Protocol):
         fill_price: int | None = None, fill_qty: int | None = None,
         api_code: str | None = None, api_message: str | None = None,
         settled_at: datetime | None = None,
-    ) -> None: ...
+    ) -> None:
+        """존재하지 않는 `client_ref` 는 `OrderLogNotFound` 를 낸다.
+
+        종결 상태에서의 역행, 이미 기록된 체결값의 덮어쓰기, `req_qty` 를 넘는
+        `fill_qty` 는 `OrderLogInvariantError` 를 낸다.
+        """
+        ...
 
     def load_pending_orders(self) -> list[dict[str, object]]:
         """SENDING·ACCEPTED·UNKNOWN 상태의 주문. 재시작 복구가 쓴다."""
@@ -138,7 +167,9 @@ class RepositoryPort(Protocol):
         """order_log 에서 집계한 실현손익(H5).
 
         도메인에는 이 값이 없다 — after_sell 이 fill_price·fill_qty 를 비우므로
-        단계 상태만으로는 계산할 수 없다.
+        단계 상태만으로는 계산할 수 없다. 체결 데이터(fill_price·fill_qty)를
+        기준으로 집계한다 — status 가 아니다. status 는 주문의 생애가 어디서
+        끝났는지를 말하고, 체결 데이터는 실제로 무엇이 오갔는지를 말한다.
         """
         ...
 

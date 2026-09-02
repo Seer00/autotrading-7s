@@ -12,6 +12,7 @@ from autotrading7s.adapters.sqlite.repository import SqliteRepository
 from autotrading7s.domain.cycle import confirm_anchor
 from autotrading7s.domain.ladder import Ladder
 from autotrading7s.domain.types import OrderPath, Side
+from autotrading7s.ports.repository import OrderLogInvariantError, OrderLogNotFound
 
 T0 = datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc)
 FIVE = Decimal("0.05")
@@ -167,3 +168,126 @@ def test_realized_pnl_is_scoped_to_the_cycle(repo_and_cycle):
     _filled(repo, cycle_id, side=Side.SELL, price=9_450, qty=111)
     _filled(repo, other.cycle_id, side=Side.SELL, price=1_000_000, qty=1)
     assert repo.realized_pnl_for_cycle(cycle_id) == 9_450 * 111
+
+
+# ── Fix Round 1, Finding 1/2: 집계는 status 가 아니라 체결 데이터를 본다 ──────
+
+def test_realized_pnl_counts_a_partially_filled_buy_that_was_then_canceled(
+    repo_and_cycle,
+):
+    """설계서 200행의 정상 절차: 부분체결 매수는 체결분만으로 확정하고 잔량을
+    취소한다. 그 주문은 CANCELED 로 끝나지만 체결분의 취득원가는 실현손익
+    계산에 남아야 한다 — 아니면 나중에 그 40주를 팔았을 때 매수 원가 없이
+    매도 금액만 잡혀 이익이 380,000원 과대평가된다."""
+    repo, cycle_id = repo_and_cycle
+    ref = an_order(repo, cycle_id, side=Side.BUY, req_price=9_500, req_qty=105)
+    repo.update_order_log(client_ref=ref, status="PARTIAL", broker_order_id="B",
+                          fill_price=9_500, fill_qty=40, settled_at=T0)
+    repo.update_order_log(client_ref=ref, status="CANCELED")  # 잔량 65주 취소
+    _filled(repo, cycle_id, side=Side.SELL, price=9_980, qty=40)
+    assert repo.realized_pnl_for_cycle(cycle_id) == 40 * (9_980 - 9_500)
+
+
+def test_realized_pnl_excludes_rejected_orders_even_with_fill_data(repo_and_cycle):
+    """REJECTED 인 행에 체결값이 있다면 그 자체가 손상이다 — 세지 않는다."""
+    repo, cycle_id = repo_and_cycle
+    ref = an_order(repo, cycle_id, side=Side.BUY, req_price=9_000, req_qty=100)
+    repo.update_order_log(client_ref=ref, status="REJECTED", fill_price=9_000,
+                          fill_qty=100, settled_at=T0)
+    assert repo.realized_pnl_for_cycle(cycle_id) == 0
+
+
+# ── Fix Round 1, Finding 3: update_order_log 는 없는 client_ref 를 거부한다 ──
+
+def test_update_order_log_raises_for_unknown_client_ref(repo_and_cycle):
+    repo, cycle_id = repo_and_cycle
+    with pytest.raises(OrderLogNotFound):
+        repo.update_order_log(client_ref="does-not-exist", status="FILLED")
+
+
+# ── Fix Round 1, Finding 4: 종결 상태에서 역행할 수 없다 ────────────────────
+
+def test_update_order_log_refuses_to_regress_out_of_terminal_status(repo_and_cycle):
+    repo, cycle_id = repo_and_cycle
+    ref = an_order(repo, cycle_id, side=Side.BUY, req_price=10_000, req_qty=100)
+    repo.update_order_log(client_ref=ref, status="FILLED", fill_price=10_000,
+                          fill_qty=100, settled_at=T0)
+    with pytest.raises(OrderLogInvariantError):
+        repo.update_order_log(client_ref=ref, status="ACCEPTED")
+
+
+def test_update_order_log_allows_idempotent_reconfirmation_of_terminal_status(
+    repo_and_cycle,
+):
+    """설계서 9절의 UNKNOWN 재조회는 같은 결말의 재확인일 수 있다 — 재시도가
+    안전해야 한다."""
+    repo, cycle_id = repo_and_cycle
+    ref = an_order(repo, cycle_id, side=Side.BUY, req_price=10_000, req_qty=100)
+    repo.update_order_log(client_ref=ref, status="FILLED", fill_price=10_000,
+                          fill_qty=100, settled_at=T0)
+    repo.update_order_log(client_ref=ref, status="FILLED", fill_price=10_000,
+                          fill_qty=100, settled_at=T0)  # 재확인 — 예외 없음
+    assert repo.realized_pnl_for_cycle(cycle_id) == -10_000 * 100
+
+
+def test_update_order_log_allows_partial_to_filled(repo_and_cycle):
+    """PARTIAL 은 종결이 아니다 — 최종 수량으로 갱신될 수 있다."""
+    repo, cycle_id = repo_and_cycle
+    ref = an_order(repo, cycle_id, side=Side.BUY, req_price=9_500, req_qty=105)
+    repo.update_order_log(client_ref=ref, status="PARTIAL", fill_price=9_500,
+                          fill_qty=40, settled_at=T0)
+    repo.update_order_log(client_ref=ref, status="FILLED", fill_price=9_500,
+                          fill_qty=105, settled_at=T0)  # 예외 없음
+    assert repo.realized_pnl_for_cycle(cycle_id) == -9_500 * 105
+
+
+def test_update_order_log_allows_partial_to_canceled(repo_and_cycle):
+    """PARTIAL 은 종결이 아니다 — 잔량 취소로 끝날 수 있다(설계서 200행)."""
+    repo, cycle_id = repo_and_cycle
+    ref = an_order(repo, cycle_id, side=Side.BUY, req_price=9_500, req_qty=105)
+    repo.update_order_log(client_ref=ref, status="PARTIAL", fill_price=9_500,
+                          fill_qty=40, settled_at=T0)
+    repo.update_order_log(client_ref=ref, status="CANCELED")  # 예외 없음
+    assert repo.realized_pnl_for_cycle(cycle_id) == -9_500 * 40
+
+
+# ── Fix Round 1, Finding 5: 종결된 체결값은 다른 값으로 덮어쓸 수 없다 ──────
+
+def test_update_order_log_refuses_to_overwrite_settled_fill(repo_and_cycle):
+    repo, cycle_id = repo_and_cycle
+    ref = an_order(repo, cycle_id, side=Side.BUY, req_price=10_000, req_qty=100)
+    repo.update_order_log(client_ref=ref, status="FILLED", fill_price=10_000,
+                          fill_qty=100, settled_at=T0)
+    with pytest.raises(OrderLogInvariantError):
+        repo.update_order_log(client_ref=ref, status="FILLED", fill_price=1,
+                              fill_qty=1, settled_at=T0)
+
+
+def test_update_order_log_allows_retry_with_no_fill_values_after_terminal(
+    repo_and_cycle,
+):
+    """None 은 COALESCE 로 기존 값을 유지한다 — 덮어쓰기가 아니다."""
+    repo, cycle_id = repo_and_cycle
+    ref = an_order(repo, cycle_id, side=Side.BUY, req_price=10_000, req_qty=100)
+    repo.update_order_log(client_ref=ref, status="FILLED", fill_price=10_000,
+                          fill_qty=100, settled_at=T0)
+    repo.update_order_log(client_ref=ref, status="FILLED")  # 예외 없음
+    assert repo.realized_pnl_for_cycle(cycle_id) == -10_000 * 100
+
+
+# ── Fix Round 1, Finding 6: fill_qty 는 req_qty 를 넘을 수 없다 ─────────────
+
+def test_update_order_log_refuses_fill_qty_exceeding_req_qty(repo_and_cycle):
+    repo, cycle_id = repo_and_cycle
+    ref = an_order(repo, cycle_id, side=Side.BUY, req_price=10_000, req_qty=100)
+    with pytest.raises(OrderLogInvariantError):
+        repo.update_order_log(client_ref=ref, status="FILLED", fill_price=10_000,
+                              fill_qty=99_999, settled_at=T0)
+
+
+def test_update_order_log_allows_fill_qty_equal_to_req_qty(repo_and_cycle):
+    repo, cycle_id = repo_and_cycle
+    ref = an_order(repo, cycle_id, side=Side.BUY, req_price=10_000, req_qty=100)
+    repo.update_order_log(client_ref=ref, status="FILLED", fill_price=10_000,
+                          fill_qty=100, settled_at=T0)  # 예외 없음
+    assert repo.realized_pnl_for_cycle(cycle_id) == -10_000 * 100
