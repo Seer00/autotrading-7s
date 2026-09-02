@@ -1148,7 +1148,7 @@ Run:
 .venv/bin/python -m pytest tests/adapters/sqlite/test_migrations.py -v
 .venv/bin/python -m pytest tests/ -q
 ```
-Expected: PASS (11 tests + 기존 전부)
+Expected: PASS (이 파일의 테스트 전부 + 기존 테스트 전부)
 
 - [ ] **Step 6: 커밋**
 
@@ -1824,7 +1824,7 @@ Run:
 .venv/bin/python -m pytest tests/adapters/sqlite/test_mapping_config_cycle.py -v
 .venv/bin/python -m pytest tests/ -q
 ```
-Expected: PASS (16 tests + 기존 전부)
+Expected: PASS (이 파일의 테스트 전부 + 기존 테스트 전부)
 
 - [ ] **Step 7: 커밋**
 
@@ -2204,7 +2204,7 @@ Run:
 .venv/bin/python -m pytest tests/adapters/sqlite/test_mapping_stage.py -v
 .venv/bin/python -m pytest tests/ -q
 ```
-Expected: PASS (18 tests + 기존 전부)
+Expected: PASS (이 파일의 테스트 전부 + 기존 테스트 전부)
 
 - [ ] **Step 6: 커밋**
 
@@ -2600,7 +2600,7 @@ Run:
 .venv/bin/python -m pytest tests/adapters/sqlite/test_repository_core.py -v
 .venv/bin/python -m pytest tests/ -q
 ```
-Expected: PASS (14 tests + 기존 전부)
+Expected: PASS (이 파일의 테스트 전부 + 기존 테스트 전부)
 
 - [ ] **Step 6: 커밋**
 
@@ -2922,7 +2922,7 @@ Run:
 .venv/bin/python -m pytest tests/adapters/sqlite/test_repository_orders.py -v
 .venv/bin/python -m pytest tests/ -q
 ```
-Expected: PASS (14 tests + 기존 전부)
+Expected: PASS (이 파일의 테스트 전부 + 기존 테스트 전부)
 
 - [ ] **Step 6: 커밋**
 
@@ -3216,7 +3216,7 @@ Run:
 .venv/bin/python -m pytest tests/adapters/sqlite/test_repository_logs.py -v
 .venv/bin/python -m pytest tests/ -q
 ```
-Expected: PASS (10 tests + 기존 전부). 특히 `test_repository_satisfies_the_port` 가
+Expected: PASS (이 파일의 테스트 전부 + 기존 테스트 전부). 특히 `test_repository_satisfies_the_port` 가
 통과해야 한다 — Task 3 이 고정한 17개 메서드를 전부 채웠다는 뜻이다.
 
 - [ ] **Step 5: 커밋**
@@ -3447,7 +3447,7 @@ async def test_the_same_script_and_mode_gives_the_same_result_twice():
 `pytest-asyncio` 가 이미 `.venv` 에 설치되어 있다. `pyproject.toml` 의
 `[tool.pytest.ini_options]` 에 `asyncio_mode = "strict"` 를 추가하고 위처럼
 `pytestmark = pytest.mark.asyncio` 를 쓴다. `strict` 를 쓰는 이유는 `auto` 가 동기
-테스트까지 감싸려 시도해 기존 453개에 영향을 줄 수 있기 때문이다.
+테스트까지 감싸려 시도해 기존 테스트 전부에 영향을 줄 수 있기 때문이다.
 
 - [ ] **Step 2: 테스트 실패 확인**
 
@@ -3678,7 +3678,7 @@ Run:
 .venv/bin/python -m pytest tests/adapters/test_fake_broker.py -v
 .venv/bin/python -m pytest tests/ -q
 ```
-Expected: PASS (19 tests + 기존 전부). `asyncio_mode = "strict"` 추가가 기존 453개에
+Expected: PASS (이 파일의 테스트 전부 + 기존 테스트 전부). `asyncio_mode = "strict"` 추가가 기존 테스트 전부에
 영향을 주지 않아야 한다 — 하나라도 깨지면 멈추고 보고한다.
 
 - [ ] **Step 6: 커밋**
