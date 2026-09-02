@@ -1935,7 +1935,8 @@ def tick(price: int, source: TickSource = TickSource.WS) -> Tick:
 
 def run(price: int, states, cycle=None, market_open=True, now=T0, params=PARAMS):
     return decide(tick=tick(price), cycle=cycle or running_cycle(),
-                  states=states, params=params, now=now, market_open=market_open)
+                  states=states, params=params, now=now, market_open=market_open,
+                  stock_code="005930")
 
 
 def test_buys_next_stage_when_trigger_reached():
@@ -2190,7 +2191,7 @@ git commit -m "feat: 매수 트리거 판정 추가 (규칙 2·4·5)
 
 **Interfaces:**
 - Consumes: `target_price` (태스크 3), `BuyStage`·`SellStage`·`decide` (태스크 7)
-- Produces: `decide()` 가 `SellStage` 를 반환할 수 있게 확장. 시그니처 변경 없음
+- Produces: `decide()` 가 `SellStage` 를 반환할 수 있게 확장. 시그니처는 Task 7 수정 라운드에서 `stock_code: str` 필수 키워드가 추가된 형태이며 이 태스크에서 더 변경하지 않는다
 
 **설계서 모호성 해소:** 설계서 규칙 1은 "매도 먼저 집행"이라고만 적혀 있어 같은 틱에 매도와 매수를 함께 반환할지가 불명확하다. **매도가 하나라도 있으면 그 틱에서는 매도만 반환한다**로 확정한다. 근거는 두 가지다. ① 규칙 1의 목적이 "예수금 확보 후 매수"인데, 같은 틱에 둘을 함께 내면 매도 대금이 들어오기 전에 매수가 나간다. ② 규칙 2의 "한 틱에 하나씩" 철학과 일관된다. 틱 간격이 통상 1초 미만이라 매수는 다음 틱에 평가되므로 실질 지연이 없다.
 
@@ -2237,7 +2238,7 @@ def stage(lad: Ladder, no: int, status: StageStatus,
 def run(price: int, states, lad: Ladder, params=PARAMS, now=T0):
     return decide(tick=Tick(code="005930", price=price, at=T0, source=TickSource.WS),
                   cycle=running_cycle(lad), states=states, params=params,
-                  now=now, market_open=True)
+                  now=now, market_open=True, stock_code="005930")
 
 
 def test_sells_when_target_reached():
@@ -2476,7 +2477,7 @@ def sold_then_waiting(lad: Ladder, no: int, sold_at: datetime) -> StageState:
 def run(price: int, states, lad: Ladder, params: TriggerParams, now: datetime):
     return decide(tick=Tick(code="005930", price=price, at=now, source=TickSource.WS),
                   cycle=running_cycle(lad), states=states, params=params,
-                  now=now, market_open=True)
+                  now=now, market_open=True, stock_code="005930")
 
 
 @pytest.mark.parametrize(
@@ -3061,6 +3062,7 @@ def test_full_cycle_down_then_up_closes_at_zero_holdings():
                       source=TickSource.WS),
             cycle=cycle, states=states, params=params,
             now=clock.now(), market_open=clock.is_market_open(),
+            stock_code="005930",
         )
         for d in decisions:
             ctx = GuardContext(
@@ -3128,6 +3130,7 @@ def test_no_activity_outside_market_hours():
                       source=TickSource.WS),
             cycle=cycle, states=states, params=TriggerParams(target_pct=FIVE),
             now=clock.now(), market_open=clock.is_market_open(),
+            stock_code="005930",
         ) == []
 
 
@@ -3144,7 +3147,7 @@ def test_total_limit_stops_further_buys():
     decisions = decide(
         tick=Tick(code="005930", price=9_500, at=T0, source=TickSource.WS),
         cycle=cycle, states=states, params=TriggerParams(target_pct=FIVE),
-        now=T0, market_open=True,
+        now=T0, market_open=True, stock_code="005930",
     )
     assert len(decisions) == 1
     ctx = GuardContext(stock_invested=6_900_000, stock_limit=7_000_000,
