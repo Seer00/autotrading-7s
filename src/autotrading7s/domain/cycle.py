@@ -123,7 +123,10 @@ def confirm_anchor(
     """1단계가 체결되어 앵커가 확정됐다. 사다리를 사이클에 고정한다."""
     _guard(cycle, CycleStatus.RUNNING)
     if anchor_price != ladder.anchor_price:
-        raise ValueError(
+        # Cycle.__post_init__ 은 동일한 조건(앵커·사다리 불일치)을
+        # DomainInvariantError 로 낸다 — 여기서도 같은 예외 타입을 써서
+        # 도메인 불변식 위반이 항상 같은 방식으로 드러나게 한다.
+        raise DomainInvariantError(
             f"anchor mismatch: {anchor_price} != ladder {ladder.anchor_price}"
         )
     return replace(
@@ -190,7 +193,8 @@ def is_cycle_complete(states: Sequence[StageState]) -> bool:
     남아 있으면 곧 보유가 생길 수 있으므로 종료로 보지 않는다.
 
     빈 단계 리스트는 데이터 무결성 실패다 — 단계가 없는 사이클은 존재할 수
-    없으므로 "종료됨"으로 답하지 않고 ValueError 를 던진다.
+    없으므로 "종료됨"으로 답하지 않고 DomainInvariantError(ValueError 의
+    하위)를 던진다.
     """
     if not states:
         raise DomainInvariantError("stage states sequence is empty — data integrity failure")

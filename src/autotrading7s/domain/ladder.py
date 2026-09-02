@@ -60,8 +60,9 @@ class Ladder:
         # 총한도 산술까지 흘러간다. Plan 4 의 사다리 미리보기 대화상자가
         # 사용자 입력으로 이 타입을 만들기 때문에 여기는 LimitOrderRequest 와
         # 같은 성격의 외부 경계다. 타입 오류는 TypeError 로 낸다 —
-        # LadderConfigError 는 ValueError 하위라서, 값 오류를 잡으려는 호출자가
-        # 타입 오류를 함께 삼키면 안 된다.
+        # LadderConfigError 는 DomainInvariantError 를 거쳐서만(간접적으로만)
+        # ValueError 의 하위라서, 값 오류를 잡으려는 호출자가 타입 오류를
+        # 함께 삼키면 안 된다.
         _require_int("anchor_price", self.anchor_price)
         _require_int("amount_per_stage", self.amount_per_stage)
         _require_int("max_stages", self.max_stages)
