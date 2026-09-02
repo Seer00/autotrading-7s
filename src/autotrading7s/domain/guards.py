@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 from autotrading7s.domain.rules import BuyStage, SellStage
 
@@ -24,12 +24,12 @@ class GuardContext:
     max_orders_per_minute: int = 10
 
     def __post_init__(self) -> None:
-        for name in (
-            "stock_invested", "stock_limit", "total_invested", "total_limit",
-            "orders_last_minute", "max_orders_per_minute",
-        ):
-            if getattr(self, name) < 0:
-                raise ValueError(f"{name} must be non-negative: {getattr(self, name)}")
+        for field in fields(self):
+            value = getattr(self, field.name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{field.name} must be int, not {type(value).__name__}")
+            if value < 0:
+                raise ValueError(f"{field.name} must be non-negative: {value}")
 
 
 @dataclass(frozen=True, slots=True)

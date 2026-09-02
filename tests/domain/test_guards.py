@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
 from autotrading7s.domain.guards import GuardContext, check_buy, check_sell
@@ -90,3 +92,74 @@ def test_reason_records_limit_usage():
 def test_rejects_negative_context(bad: int):
     with pytest.raises(ValueError):
         ctx(stock_invested=bad)
+
+
+# Type validation tests (Fix Round 1)
+
+@pytest.mark.parametrize("field_name", [
+    "stock_invested", "stock_limit", "total_invested", "total_limit",
+    "orders_last_minute", "max_orders_per_minute"
+])
+def test_rejects_float_inf_for_all_fields(field_name: str):
+    """Each field rejects float('inf') with TypeError."""
+    with pytest.raises(TypeError, match=f"{field_name} must be int"):
+        ctx(**{field_name: float('inf')})
+
+
+@pytest.mark.parametrize("field_name", [
+    "stock_invested", "stock_limit", "total_invested", "total_limit",
+    "orders_last_minute", "max_orders_per_minute"
+])
+def test_rejects_float_nan_for_all_fields(field_name: str):
+    """Each field rejects float('nan') with TypeError."""
+    with pytest.raises(TypeError, match=f"{field_name} must be int"):
+        ctx(**{field_name: float('nan')})
+
+
+def test_rejects_ordinary_float():
+    """Ordinary float values (not inf/nan) also raise TypeError."""
+    with pytest.raises(TypeError, match="stock_limit must be int"):
+        ctx(stock_limit=7_000_000.0)
+
+
+def test_rejects_decimal():
+    """Decimal values raise TypeError."""
+    with pytest.raises(TypeError, match="stock_limit must be int"):
+        ctx(stock_limit=Decimal(7_000_000))
+
+
+def test_rejects_bool():
+    """bool raises TypeError (even though it's an int subclass)."""
+    with pytest.raises(TypeError, match="stock_limit must be int"):
+        ctx(stock_limit=True)
+
+
+def test_allows_zero_investment_caps():
+    """stock_limit=0 is a legitimate per-stock kill switch."""
+    c = ctx(stock_limit=0)
+    assert c.stock_limit == 0
+
+
+def test_allows_zero_orders_per_minute():
+    """max_orders_per_minute=0 is a legitimate frequency kill switch."""
+    c = ctx(max_orders_per_minute=0)
+    assert c.max_orders_per_minute == 0
+
+
+def test_allows_total_limit_below_stock_limit():
+    """total_limit < stock_limit is legitimate; the tighter limit binds."""
+    c = ctx(stock_limit=10_000_000, total_limit=5_000_000)
+    assert c.total_limit < c.stock_limit
+
+
+def test_rejects_bypass_via_float_inf_stock_limit():
+    """The exact bypass scenario that would have allowed every buy."""
+    with pytest.raises(TypeError, match="stock_limit must be int"):
+        GuardContext(
+            stock_invested=6_900_000,
+            stock_limit=float('inf'),
+            total_invested=0,
+            total_limit=21_000_000,
+            orders_last_minute=0,
+            max_orders_per_minute=10,
+        )
