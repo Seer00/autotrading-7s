@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 
+from autotrading7s.domain.errors import DomainInvariantError
 from autotrading7s.domain.rules import BuyStage, SellStage
 
 
@@ -29,7 +30,7 @@ class GuardContext:
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError(f"{field.name} must be int, not {type(value).__name__}")
             if value < 0:
-                raise ValueError(f"{field.name} must be non-negative: {value}")
+                raise DomainInvariantError(f"{field.name} must be non-negative: {value}")
 
 
 @dataclass(frozen=True, slots=True)

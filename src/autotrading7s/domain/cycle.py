@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 
+from autotrading7s.domain.errors import DomainInvariantError
 from autotrading7s.domain.ladder import Ladder
 from autotrading7s.domain.stage import StageState
 from autotrading7s.domain.types import CloseReason, CycleStatus, StageStatus
@@ -54,7 +55,7 @@ class Cycle:
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError(f"{name} must be int, not {type(value).__name__}")
             if value <= 0:
-                raise ValueError(f"{name} must be positive: {value}")
+                raise DomainInvariantError(f"{name} must be positive: {value}")
 
         # RUNNING·PAUSED 는 앵커와 사다리가 반드시 있어야 한다. 트리거 판정을
         # 하거나(RUNNING) 판정을 재개할 수 있는(PAUSED) 상태이므로 사다리 없이는
@@ -62,20 +63,20 @@ class Cycle:
         # 생기기 전인 STARTING 에서도 시작할 수 있다(설계서 11.1절).
         requires_ladder = self.status in (CycleStatus.RUNNING, CycleStatus.PAUSED)
         if requires_ladder and self.anchor_price is None:
-            raise ValueError(
+            raise DomainInvariantError(
                 f"Cycle status {self.status.value} requires anchor_price, got None"
             )
         # 앵커가 있으면 사다리도 있어야 한다. 앵커는 사다리 확정과 같은 순간에
         # 생기므로(confirm_anchor), 앵커만 있는 행은 어느 상태에서든 손상이다.
         if self.ladder is None and (requires_ladder or self.anchor_price is not None):
-            raise ValueError(
+            raise DomainInvariantError(
                 f"Cycle status {self.status.value} requires ladder, got None"
             )
         # 거울상: 사다리만 있고 앵커가 없는 행도 손상이다. 위 검사와 같은
         # 이유이며(둘은 confirm_anchor 에서 같은 순간에 생긴다), RUNNING·
         # PAUSED 는 첫 검사가 이미 앵커를 요구하므로 여기 닿지 않는다.
         if self.anchor_price is None and self.ladder is not None:
-            raise ValueError(
+            raise DomainInvariantError(
                 f"Cycle status {self.status.value} with ladder "
                 "requires anchor_price, got None"
             )
@@ -84,7 +85,7 @@ class Cycle:
         # 진실인지 알 방법이 없다.
         if self.anchor_price is not None and self.ladder is not None:
             if self.anchor_price != self.ladder.anchor_price:
-                raise ValueError(
+                raise DomainInvariantError(
                     f"anchor_price {self.anchor_price} != "
                     f"ladder.anchor_price {self.ladder.anchor_price}"
                 )
@@ -192,7 +193,7 @@ def is_cycle_complete(states: Sequence[StageState]) -> bool:
     없으므로 "종료됨"으로 답하지 않고 ValueError 를 던진다.
     """
     if not states:
-        raise ValueError("stage states sequence is empty — data integrity failure")
+        raise DomainInvariantError("stage states sequence is empty — data integrity failure")
     pending = (StageStatus.BUY_PENDING, StageStatus.SELL_PENDING)
     if any(s.status in pending for s in states):
         return False

@@ -10,6 +10,8 @@ from datetime import datetime
 from enum import Enum
 from uuid import UUID
 
+from autotrading7s.domain.errors import DomainInvariantError
+
 
 class Side(Enum):
     BUY = "BUY"
@@ -71,7 +73,7 @@ class Tick:
         if isinstance(self.price, bool) or not isinstance(self.price, int):
             raise TypeError(f"price must be int, not {type(self.price).__name__}")
         if self.price <= 0:
-            raise ValueError(f"price must be positive: {self.price}")
+            raise DomainInvariantError(f"price must be positive: {self.price}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,9 +96,9 @@ class LimitOrderRequest:
         if isinstance(self.price, bool) or not isinstance(self.price, int):
             raise TypeError(f"price must be int, not {type(self.price).__name__}")
         if self.qty <= 0:
-            raise ValueError(f"qty must be positive: {self.qty}")
+            raise DomainInvariantError(f"qty must be positive: {self.qty}")
         if self.price <= 0:
-            raise ValueError(f"price must be positive: {self.price}")
+            raise DomainInvariantError(f"price must be positive: {self.price}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,7 +118,7 @@ class MarketSellRequest:
         if isinstance(self.qty, bool) or not isinstance(self.qty, int):
             raise TypeError(f"qty must be int, not {type(self.qty).__name__}")
         if self.qty <= 0:
-            raise ValueError(f"qty must be positive: {self.qty}")
+            raise DomainInvariantError(f"qty must be positive: {self.qty}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,7 +159,7 @@ class Holding:
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError(f"{name} must be int, not {type(value).__name__}")
             if value < 0:
-                raise ValueError(f"{name} must be non-negative: {value}")
+                raise DomainInvariantError(f"{name} must be non-negative: {value}")
 
 
 @dataclass(frozen=True, slots=True)

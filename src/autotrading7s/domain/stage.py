@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime
 
+from autotrading7s.domain.errors import DomainInvariantError
 from autotrading7s.domain.types import StageStatus
 
 
@@ -89,7 +90,7 @@ class StageState:
         if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(f"{name} must be int, not {type(value).__name__}")
         if value < minimum:
-            raise ValueError(f"{name} must be {phrase}: {value}")
+            raise DomainInvariantError(f"{name} must be {phrase}: {value}")
 
     def _check_fill_field(self, name: str, value: int | None) -> None:
         """`fill_price`/`fill_qty` 공통 검증: 존재 → 타입 → 양수, 이 순서로.
@@ -101,13 +102,13 @@ class StageState:
         (설계서 3.1절 — float 금지).
         """
         if value is None:
-            raise ValueError(
+            raise DomainInvariantError(
                 f"status {self.status.value}: {name} must be positive, got {value}"
             )
         if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(f"{name} must be int, not {type(value).__name__}")
         if value <= 0:
-            raise ValueError(
+            raise DomainInvariantError(
                 f"status {self.status.value}: {name} must be positive, got {value}"
             )
 

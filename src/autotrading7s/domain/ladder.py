@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
+from autotrading7s.domain.errors import DomainInvariantError
 from autotrading7s.domain.tick_size import normalize_tick
 from autotrading7s.domain.types import Side
 
@@ -16,8 +17,12 @@ MIN_STAGES = 2
 MAX_STAGES = 7
 
 
-class LadderConfigError(ValueError):
-    """사다리 설정이 실행 불가능할 때. 설정 등록 시점에 던진다."""
+class LadderConfigError(DomainInvariantError):
+    """사다리 설정이 실행 불가능할 때. 설정 등록 시점에 던진다.
+
+    `DomainInvariantError` 를 상속하므로 매핑 계층이 복원된 `ladder_json` 의
+    정합성 실패를 다른 도메인 불변식 실패와 같은 방식으로 잡을 수 있다.
+    """
 
 
 def _require_int(name: str, value: object) -> None:
