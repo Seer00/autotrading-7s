@@ -21,6 +21,8 @@ RECONCILE_VERDICTS: frozenset[str] = frozenset(
 
 
 def _require_aware(at: datetime) -> None:
+    """같은 패키지의 `snapshot.py` 도 이것을 쓴다 — 같은 규칙을 두 번 쓰면
+    어긋난다. 밑줄로 시작하지만 `app` 안에서는 의도된 공유다."""
     if at.tzinfo is None or at.tzinfo.utcoffset(at) is None:
         raise ValueError(f"event timestamp must be tz-aware: {at!r}")
 
