@@ -76,9 +76,38 @@ def test_cancel_buy_returns_to_waiting():
 
 def test_cancel_sell_returns_to_holding():
     """매도 주문이 체결 없이 취소되면 보유로 되돌아간다."""
-    st = cancel_sell(to_sell_pending(holding()))
+    st = cancel_sell(to_sell_pending(holding()), remaining_qty=105)
     assert st.status is StageStatus.HOLDING
     assert st.held_qty == 105
+
+
+def test_cancel_sell_partial_fill_keeps_remaining_qty_only():
+    """당일 마감으로 미체결 잔량이 취소되면 남은 수량만 HOLDING 으로 복귀한다."""
+    holding_111 = StageState(
+        stage_no=3, status=StageStatus.HOLDING, trigger_price=9_000,
+        planned_qty=111, fill_price=8_950, fill_qty=111,
+    )
+    st = cancel_sell(to_sell_pending(holding_111), remaining_qty=71)
+    assert st.status is StageStatus.HOLDING
+    assert st.fill_qty == 71
+    assert st.held_qty == 71
+
+
+def test_cancel_sell_rejects_zero_remaining_qty():
+    """0 은 전량 체결이므로 after_sell 의 몫이다 — 취소로 표현하지 않는다."""
+    with pytest.raises(ValueError, match="remaining_qty"):
+        cancel_sell(to_sell_pending(holding()), remaining_qty=0)
+
+
+def test_cancel_sell_rejects_remaining_qty_above_fill_qty():
+    """보유했던 것보다 많은 잔량을 주장할 수 없다 — 메시지에 두 값 모두 기록."""
+    with pytest.raises(ValueError, match=r"remaining_qty=112.*fill_qty=105"):
+        cancel_sell(to_sell_pending(holding()), remaining_qty=112)
+
+
+def test_cancel_sell_rejects_negative_remaining_qty():
+    with pytest.raises(ValueError, match="remaining_qty"):
+        cancel_sell(to_sell_pending(holding()), remaining_qty=-1)
 
 
 def test_partial_buy_fill_confirms_with_filled_quantity_only():

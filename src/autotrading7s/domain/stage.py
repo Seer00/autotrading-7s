@@ -137,10 +137,22 @@ def cancel_buy(state: StageState) -> StageState:
     return replace(state, status=StageStatus.WAITING)
 
 
-def cancel_sell(state: StageState) -> StageState:
-    """매도 주문이 체결 없이 취소됨 → 보유 복귀."""
+def cancel_sell(state: StageState, *, remaining_qty: int) -> StageState:
+    """매도 주문이 취소되어 보유로 되돌아간다.
+
+    호출자가 남은 수량을 알려준다. 한국 주식 주문은 당일에만 유효하므로,
+    부분체결된 매도 주문의 미체결 잔량이 마감과 함께 취소되면 처음
+    보유했던 수량보다 적은 채로 HOLDING 에 복귀하는 것이 일상적인 경로다
+    (설계서 9절). 전혀 체결되지 않은 취소(``remaining_qty ==
+    state.fill_qty``)는 그 특수 케이스일 뿐, 별도 분기가 아니다.
+    """
     _guard(state, StageStatus.HOLDING)
-    return replace(state, status=StageStatus.HOLDING)
+    if not 0 < remaining_qty <= state.fill_qty:
+        raise ValueError(
+            f"remaining_qty must be in (0, fill_qty]: "
+            f"remaining_qty={remaining_qty}, fill_qty={state.fill_qty}"
+        )
+    return replace(state, status=StageStatus.HOLDING, fill_qty=remaining_qty)
 
 
 def force_sold(state: StageState, *, at: datetime) -> StageState:

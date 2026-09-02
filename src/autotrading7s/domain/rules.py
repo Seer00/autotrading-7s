@@ -165,6 +165,13 @@ def _eval_sells(
                 # 매수호가에 체결되므로, 목표가로 걸어도 현재가가 더 높으면
                 # 더 좋은 가격에 체결된다. 목표 보장과 체결 확률을 동시에 얻는다.
                 limit_price=target,
+                # 매수(_eval_buy)는 qty 를 ladder.planned_qty(n) 로 매번 다시
+                # 계산한다 — 사다리는 각 단계가 "얼마를 사려고 하는지"의
+                # 계획이라 다시 계산해도 항상 같다. 매도는 다르다: 실제로
+                # "얼마를 들고 있는지"는 사다리가 알 수 없고 단계 자신의
+                # 기록만이 안다. cancel_sell 이 부분체결 후 취소 시 남은
+                # 수량으로 fill_qty 를 갱신해 주므로, 여기서 state.fill_qty
+                # 를 그대로 신뢰하는 것이 맞다.
                 qty=state.fill_qty,
                 reason=_sell_reason(state=state, tick=tick, target=target,
                                     params=params),
