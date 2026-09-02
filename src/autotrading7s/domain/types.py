@@ -129,6 +129,12 @@ class OrderAck:
 
 
 @dataclass(frozen=True, slots=True)
+class CancelAck:
+    broker_order_id: str
+    canceled_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class OrderStatus:
     client_ref: UUID
     broker_order_id: str
