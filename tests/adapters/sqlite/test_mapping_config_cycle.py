@@ -163,3 +163,35 @@ def test_row_to_cycle_wraps_an_unknown_status():
     ) | {"id": 3, "status": "BOGUS"}
     with pytest.raises(CorruptRowError):
         row_to_cycle(row)
+
+
+# ── 감싸지 않는 것의 절반 ──────────────────────────────────────────────
+#
+# 위 테스트들은 전부 "이건 CorruptRowError 로 감싸지는가" 만 묻는다. 그것만으로는
+# 부족하다 — CorruptRowError 는 DomainInvariantError 의 하위이고 그것은
+# ValueError 의 하위이므로, 감싸는 범위가 넓어져도(예: TypeError 까지 잡아버려도)
+# 이 assert 들은 여전히 통과한다. 호출자 버그(TypeError)가 감싸이지 않고 그대로
+# 올라오는지를 TypeError 를 이름으로 못박아 확인해야 그 범위가 넓어지는 회귀를
+# 잡는다.
+
+
+def test_json_to_ladder_does_not_wrap_a_caller_type_error():
+    """정수를 넘기면 json.loads 가 TypeError 를 낸다 — 그건 호출자 버그다."""
+    with pytest.raises(TypeError):
+        json_to_ladder(42)  # type: ignore[arg-type]
+
+
+def test_row_to_config_does_not_wrap_a_caller_type_error():
+    """비율 컬럼에 str 이 아닌 값(float)을 넣으면 text_to_ratio 가 TypeError 를 낸다."""
+    row = config_to_row(a_config()) | {"id": 1, "drop_pct": 0.05}
+    with pytest.raises(TypeError):
+        row_to_config(row)
+
+
+def test_row_to_cycle_does_not_wrap_a_caller_type_error():
+    """시각 컬럼에 str 이 아닌 값을 넣으면 text_to_dt 가 TypeError 를 낸다."""
+    row = cycle_to_row(
+        Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.IDLE, started_at=T0)
+    ) | {"id": 1, "started_at": 12345}
+    with pytest.raises(TypeError):
+        row_to_cycle(row)

@@ -13,9 +13,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
-from datetime import datetime
-from decimal import Decimal
 from typing import Any
 
 from autotrading7s.adapters.sqlite.codec import (
@@ -115,7 +112,7 @@ def ladder_to_json(ladder: Ladder) -> str:
 def json_to_ladder(text: str) -> Ladder:
     try:
         payload = json.loads(text)
-    except (json.JSONDecodeError, TypeError) as exc:
+    except json.JSONDecodeError as exc:
         raise CorruptRowError(f"corrupt ladder_json: {exc}") from exc
     try:
         return Ladder(
