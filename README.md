@@ -25,7 +25,27 @@
 `python -m autotrading7s.cli --env mock --settings settings.toml --simulate ...`
 로 GUI 없이 엔진만 돌릴 수 있다.
 
-미구현: 키움 어댑터(Plan 3), GUI(Plan 4).
+**Plan 4 (GUI) 완료 — 단, 화면 렌더링은 Windows 에서 확인해야 한다.**
+`ui/` 가 순수 뷰모델(EC2 에서 전수 테스트)과 얇은 Tkinter 셸로 나뉘어 있다.
+EC2 에는 `tkinter` 가 설치되어 있지 않아 위젯 파일은 import 조차 되지 않으므로,
+그 경계를 `tests/test_g4_prep_gate.py` 가 강제한다 — 순수 층은 `tkinter`·DB 를
+import 하지 않고, 위젯 층은 `domain`·`engine`·`ports`·`adapters` 를 import
+하지 않는다. 위젯의 **배선**은 `tkinter` 스텁으로 검증된다(모든 이름 오류가
+잡힌다); Tk 가 실제로 그리는 것은 검증되지 않는다.
+
+설계서 14.1·14.2·14.3절 목업의 숫자가 그대로 재현된다 — 보유 316주 / 평균단가
+9,458원 / 평가손익 -37,410원(-1.25%), 목표까지 열의 일곱 줄, 사다리 미리보기의
+총투입 6,978,200원 / 여유 21,800원 / 전단계 평단 7,823원(-16.2%).
+
+```bash
+python -m autotrading7s --env mock --settings settings.toml --simulate 10000,9500   # GUI (Windows)
+python -m autotrading7s.cli --env mock --settings settings.toml --simulate 10000,9500 --status  # headless
+```
+
+**Windows 검증 절차:**
+`docs/superpowers/records/2026-09-02-plan4-windows-checklist.md`
+
+미구현: 키움 어댑터(Plan 3).
 
 ## 개발
 

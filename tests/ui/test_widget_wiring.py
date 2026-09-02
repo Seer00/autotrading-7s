@@ -280,3 +280,202 @@ def test_main_window_reset_baseline_clears_the_local_warning(
     sent = [c.args[0] for c in thread.send.call_args_list]
     assert any(isinstance(c, ResetReconcileBaseline) for c in sent)
     assert presenter.holdings().rows[0].status_label != "⚠불일치"
+
+
+def _window(tkinter_stub, presenter, thread=None):
+    thread = thread or MagicMock()
+    thread.drain_events.return_value = []
+    thread.raise_if_failed.return_value = None
+    module = _module("main_window")
+    window = module.MainWindow(thread=thread, presenter=presenter)
+    return module, window, thread
+
+
+def test_emergency_button_sends_a_priority_command(tkinter_stub,
+                                                   three_row_snapshot,
+                                                   monkeypatch):
+    """[긴급청산]이 `send_priority` 로 `EmergencyLiquidate` 를 보내야 한다.
+
+    `send` 로 보내는 오타는 우선순위 보장을 조용히 무력화한다 — 그 명령이
+    일반 큐에 들어가면 앞선 명령 뒤로 밀린다.
+    """
+    from autotrading7s.app.commands import EmergencyLiquidate
+
+    presenter = Presenter("mock")
+    presenter.consume(three_row_snapshot)
+    module, window, thread = _window(tkinter_stub, presenter)
+    window._on_select(1)
+
+    dialog_module = _module("emergency_dialog")
+    monkeypatch.setattr(
+        module, "EmergencyDialog",
+        lambda parent, view: MagicMock(
+            show=lambda: dialog_module.DialogResult(reason="오작동 의심",
+                                                    confirmed_text=None)))
+    window._emergency()
+
+    sent = [c.args[0] for c in thread.send_priority.call_args_list]
+    assert len(sent) == 1
+    assert isinstance(sent[0], EmergencyLiquidate)
+    assert (sent[0].scope, sent[0].config_id) == ("SINGLE", 1)
+    assert sent[0].reason == "오작동 의심"
+
+
+def test_emergency_all_sends_scope_all_with_no_config_id(tkinter_stub,
+                                                         three_row_snapshot,
+                                                         monkeypatch):
+    """`scope="ALL"` 은 `config_id=None` 이어야 명령이 만들어진다 (설계서 11.2절)."""
+    from autotrading7s.app.commands import (
+        LIQUIDATE_ALL_CONFIRMATION,
+        EmergencyLiquidate,
+    )
+
+    presenter = Presenter("mock")
+    presenter.consume(three_row_snapshot)
+    module, window, thread = _window(tkinter_stub, presenter)
+    window._on_select(1)
+
+    dialog_module = _module("emergency_dialog")
+    monkeypatch.setattr(
+        module, "EmergencyDialog",
+        lambda parent, view: MagicMock(
+            show=lambda: dialog_module.DialogResult(
+                reason=None, confirmed_text=LIQUIDATE_ALL_CONFIRMATION)))
+    window._emergency_all()
+
+    sent = [c.args[0] for c in thread.send_priority.call_args_list]
+    assert isinstance(sent[0], EmergencyLiquidate)
+    assert (sent[0].scope, sent[0].config_id) == ("ALL", None)
+
+
+def test_force_close_button_sends_the_statement(tkinter_stub,
+                                                three_row_snapshot,
+                                                monkeypatch):
+    """D20 — 증언이 비어 있으면 `ForceClose` 생성 자체가 실패한다.
+
+    다이얼로그가 사유를 요구하므로 여기까지 오면 있어야 하고, 없으면 명령을
+    보내지 않아야 한다.
+    """
+    from datetime import UTC, datetime
+
+    from autotrading7s.app.commands import FORCE_CLOSE_CONFIRMATION, ForceClose
+    from autotrading7s.app.events import EmergencyResult
+
+    presenter = Presenter("mock")
+    presenter.consume(three_row_snapshot)
+    presenter.consume(EmergencyResult(
+        scope="SINGLE", stock_code="005930", result="FAILED", qty_before=316,
+        qty_after=316, canceled_orders=0, detail="거래정지",
+        at=datetime(2026, 9, 2, 15, 28, tzinfo=UTC)))
+    module, window, thread = _window(tkinter_stub, presenter)
+    window._on_select(1)
+
+    dialog_module = _module("emergency_dialog")
+    monkeypatch.setattr(
+        module, "ForceCloseDialog",
+        lambda parent, view: MagicMock(
+            show=lambda: dialog_module.DialogResult(
+                reason="거래정지로 청산 불가",
+                confirmed_text=FORCE_CLOSE_CONFIRMATION)))
+    window._force_close()
+
+    sent = [c.args[0] for c in thread.send_priority.call_args_list]
+    assert isinstance(sent[0], ForceClose)
+    assert sent[0].reason == "거래정지로 청산 불가"
+
+    # 사유가 없으면 보내지 않는다 — ForceClose 가 생성에서 거부한다
+    thread.send_priority.reset_mock()
+    monkeypatch.setattr(
+        module, "ForceCloseDialog",
+        lambda parent, view: MagicMock(
+            show=lambda: dialog_module.DialogResult(
+                reason=None, confirmed_text=FORCE_CLOSE_CONFIRMATION)))
+    window._force_close()
+    assert thread.send_priority.call_args_list == []
+
+
+def test_config_dialog_result_becomes_a_save_command(tkinter_stub,
+                                                     three_row_snapshot,
+                                                     monkeypatch):
+    """`parse_config_form` 의 결과를 그대로 `SaveConfig(**fields)` 에 넘긴다.
+
+    이름이 하나라도 어긋나면 [저장]이 `TypeError` 로 터진다.
+    """
+    from autotrading7s.app.commands import SaveConfig
+    from autotrading7s.ui.view_model import parse_config_form
+
+    presenter = Presenter("mock")
+    presenter.consume(three_row_snapshot)
+    module, window, thread = _window(tkinter_stub, presenter)
+
+    fields = parse_config_form({
+        "stock_code": "035720", "stock_name": "카카오", "label": "공격형",
+        "max_stages": "7", "drop_pct": "5.0", "target_pct": "5.0",
+        "amount_per_stage": "1,000,000", "rebuy_cooldown_sec": "60",
+        "total_limit": "7,000,000", "allow_rebuy": "1",
+    })
+    monkeypatch.setattr(
+        module, "ConfigDialog",
+        lambda parent, presenter_: MagicMock(show=lambda: fields))
+    window._open_config()
+
+    sent = [c.args[0] for c in thread.send.call_args_list]
+    assert isinstance(sent[-1], SaveConfig)
+    assert sent[-1].stock_code == "035720"
+    assert sent[-1].config_id is None
+
+
+def test_buttons_do_nothing_without_a_selection(tkinter_stub,
+                                                three_row_snapshot):
+    """선택이 없으면 어떤 명령도 나가지 않는다 — 엉뚱한 종목에 명령이 가면
+    긴급청산이 다른 종목을 팔 수 있다."""
+    presenter = Presenter("mock")
+    presenter.consume(three_row_snapshot)
+    module, window, thread = _window(tkinter_stub, presenter)
+
+    window._start()
+    window._pause()
+    window._resume()
+    window._reset_baseline()
+    window._emergency()
+    window._force_close()
+
+    assert thread.send.call_args_list == []
+    assert thread.send_priority.call_args_list == []
+
+
+def test_resume_sends_resume_cycle(tkinter_stub, three_row_snapshot):
+    from autotrading7s.app.commands import ResumeCycle
+
+    presenter = Presenter("mock")
+    presenter.consume(three_row_snapshot)
+    module, window, thread = _window(tkinter_stub, presenter)
+    window._on_select(2)
+    window._resume()
+    sent = [c.args[0] for c in thread.send.call_args_list]
+    assert isinstance(sent[0], ResumeCycle) and sent[0].config_id == 2
+
+
+def test_closing_the_window_shuts_the_engine_down(tkinter_stub,
+                                                  three_row_snapshot):
+    """창을 닫고 프로세스가 남으면 다음 기동에서 DB 를 두 프로세스가 쓴다 —
+    리포지토리의 단일 작성자 전제가 깨진다 (2A 핸드오버 3)."""
+    from autotrading7s.app.commands import Shutdown
+
+    presenter = Presenter("mock")
+    presenter.consume(three_row_snapshot)
+    module, window, thread = _window(tkinter_stub, presenter)
+
+    window._on_close()
+
+    sent = [c.args[0] for c in thread.send.call_args_list]
+    assert any(isinstance(c, Shutdown) for c in sent)
+    thread.stop.assert_called_once()
+
+
+def test_run_enters_the_mainloop(tkinter_stub, three_row_snapshot):
+    presenter = Presenter("mock")
+    presenter.consume(three_row_snapshot)
+    module, window, thread = _window(tkinter_stub, presenter)
+    window.run()
+    window.root.mainloop.assert_called_once()

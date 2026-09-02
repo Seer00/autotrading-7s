@@ -29,6 +29,7 @@ source = [
   "autotrading7s.engine",
   "autotrading7s.app",
   "autotrading7s.cli",
+  "autotrading7s.ui",
 ]
 
 [tool.coverage.report]
