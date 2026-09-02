@@ -29,6 +29,8 @@ from datetime import timedelta
 
 from autotrading7s.app import commands as cmd
 from autotrading7s.app.events import (
+    ConfigRejected,
+    ConfigSaved,
     CycleClosed,
     CycleLoadFailed,
     EngineStopped,
@@ -137,6 +139,8 @@ class Orchestrator:
             # D5 — 정지는 자동 트리거를 멈추는 것이고 사이클 종료가 아니다.
             self._transition(command.config_id, cycle_mod.pause,
                              allowed_from=(CycleStatus.RUNNING,))
+        elif isinstance(command, cmd.SaveConfig):
+            self._save_config(command)
         elif isinstance(command, cmd.ResetReconcileBaseline):
             self._reconciler.reset_baseline(command.stock_code)
         elif isinstance(command, cmd.Shutdown):
@@ -173,6 +177,60 @@ class Orchestrator:
         for cyc in self._repo.load_active_cycles():
             if cyc.config_id == config_id and cyc.status in allowed_from:
                 self._repo.save_cycle(fn(cyc))
+
+    def _save_config(self, command: cmd.SaveConfig) -> None:
+        """설계서 14.2절 [저장]. 거부를 반드시 이벤트로 되돌린다 —
+        그러지 않으면 눌렀는데 아무 일도 일어나지 않는 화면이 된다.
+
+        `SplitConfig` 는 검증하지 않는 순수 DTO 이고 모든 불변식이 `Ladder` 에
+        있으므로, `to_ladder` 가 저장 전에 친절한 메시지를 주는 유일한 방법이다.
+        **다만 그 임시 앵커에서는 "1단계에서 1주도 못 산다" 규칙이 결코 발동하지
+        않는다** (`amount // amount == 1`) — 그 규칙은 실제 앵커에 달렸고 저장
+        시점에는 알 수 없다. 미리보기가 사용자가 입력한 현재가로 그것을 보여주는
+        것이 그 규칙의 실제 방어선이다.
+
+        `Ladder` 가 보지 않는 두 값(`rebuy_cooldown_sec`·`total_limit`)은
+        여기서 직접 검사한다. 그러지 않으면 스키마 CHECK 가 `IntegrityError` 로
+        거부하고, 그 예외는 포트 계약에 없어서 사용자에게 이유가 전달되지 않는다.
+        """
+        at = self._clock.now()
+        try:
+            if command.rebuy_cooldown_sec < 0:
+                raise ValueError(
+                    f"rebuy_cooldown_sec must be non-negative: "
+                    f"{command.rebuy_cooldown_sec}"
+                )
+            if command.total_limit < 0:
+                raise ValueError(
+                    f"total_limit must be non-negative: {command.total_limit}"
+                )
+            config = SplitConfig(
+                config_id=command.config_id, stock_code=command.stock_code,
+                stock_name=command.stock_name, label=command.label,
+                max_stages=command.max_stages, drop_pct=command.drop_pct,
+                target_pct=command.target_pct,
+                amount_per_stage=command.amount_per_stage,
+                allow_rebuy=command.allow_rebuy,
+                rebuy_cooldown_sec=command.rebuy_cooldown_sec,
+                total_limit=command.total_limit,
+                # 신규는 IDLE 로 시작하고, 수정은 update_config 가 status 를
+                # 아예 건드리지 않는다 — 상태 전이는 set_config_status 의 몫이다.
+                status="IDLE",
+                created_at=at, updated_at=at,
+            )
+            # 단계 수·비율 범위·금액 양수를 여기서 잡는다. 스키마 CHECK 와 같은
+            # 범위이지만 이쪽이 사용자에게 읽히는 문장을 낸다.
+            config.to_ladder(anchor_price=command.amount_per_stage)
+            if command.config_id is None:
+                config_id = self._repo.save_config(config)
+            else:
+                self._repo.update_config(config, at=at)
+                config_id = command.config_id
+        except (ValueError, TypeError) as exc:
+            self._emit(ConfigRejected(config_id=command.config_id,
+                                      detail=str(exc), at=at))
+            return
+        self._emit(ConfigSaved(config_id=config_id, at=at))
 
     def _isolate(self, cyc: Cycle) -> str | None:
         """데이터 문제가 있는 사이클을 격리한다 — 사이클을 PAUSED 로.

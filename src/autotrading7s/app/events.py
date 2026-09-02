@@ -178,6 +178,30 @@ class GuardBlocked(Event):
 
 
 @dataclass(frozen=True, slots=True)
+class ConfigSaved(Event):
+    config_id: int
+    at: datetime
+
+    def __post_init__(self) -> None:
+        _require_aware(self.at)
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigRejected(Event):
+    """저장이 거부됐다. `detail` 은 도메인·리포지토리가 만든 문장을 그대로 담는다.
+
+    이 이벤트가 없으면 [저장]을 눌렀는데 아무 일도 일어나지 않는 화면이 된다.
+    """
+
+    config_id: int | None
+    detail: str
+    at: datetime
+
+    def __post_init__(self) -> None:
+        _require_aware(self.at)
+
+
+@dataclass(frozen=True, slots=True)
 class EngineStopped(Event):
     detail: str | None
     at: datetime
