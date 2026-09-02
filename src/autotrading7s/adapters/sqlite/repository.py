@@ -28,7 +28,7 @@ from autotrading7s.adapters.sqlite.mapping import (
 from autotrading7s.ports.repository import SplitConfig
 from autotrading7s.domain.cycle import Cycle
 from autotrading7s.domain.stage import StageState
-from autotrading7s.domain.types import CycleStatus
+from autotrading7s.domain.types import CycleStatus, OrderPath, Side
 
 
 class SqliteRepository:
@@ -139,3 +139,91 @@ class SqliteRepository:
                 f"ON CONFLICT(cycle_id, stage_no) DO UPDATE SET {updates}",
                 row,
             )
+
+    # ── 주문 이력 ───────────────────────────────────────────────────────
+    _PENDING_STATUSES = ("SENDING", "ACCEPTED", "UNKNOWN")
+
+    def append_order_log(
+        self, *, client_ref: str, cycle_id: int, stage_state_id: int | None,
+        side: Side, order_type: str, path: OrderPath, req_price: int | None,
+        req_qty: int, trigger_reason: str, tick_price: int | None,
+        tick_source: str | None, sent_at: datetime,
+    ) -> int:
+        """status=SENDING 으로 기록한다. 설계서 9절 ③ — 발주보다 먼저 커밋한다.
+
+        순서를 뒤집으면 발주와 기록 사이에 프로세스가 죽었을 때 브로커에는 주문이
+        있는데 우리는 모르는 고아 주문이 생기고, 다음 실행에서 중복 발주가 된다.
+        """
+        with self._conn:
+            cursor = self._conn.execute(
+                "INSERT INTO order_log (client_ref, cycle_id, stage_state_id, "
+                " side, order_type, path, req_price, req_qty, status, "
+                " trigger_reason, tick_price, tick_source, sent_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'SENDING', ?, ?, ?, ?)",
+                (client_ref, cycle_id, stage_state_id, side.value, order_type,
+                 path.value, req_price, req_qty, trigger_reason, tick_price,
+                 tick_source, dt_to_text(sent_at)),
+            )
+        return int(cursor.lastrowid)
+
+    def update_order_log(
+        self, *, client_ref: str, status: str, broker_order_id: str | None = None,
+        fill_price: int | None = None, fill_qty: int | None = None,
+        api_code: str | None = None, api_message: str | None = None,
+        settled_at: datetime | None = None,
+    ) -> None:
+        with self._conn:
+            self._conn.execute(
+                "UPDATE order_log SET status = ?, "
+                " broker_order_id = COALESCE(?, broker_order_id), "
+                " fill_price = COALESCE(?, fill_price), "
+                " fill_qty = COALESCE(?, fill_qty), "
+                " api_code = COALESCE(?, api_code), "
+                " api_message = COALESCE(?, api_message), "
+                " settled_at = COALESCE(?, settled_at) "
+                "WHERE client_ref = ?",
+                (status, broker_order_id, fill_price, fill_qty, api_code,
+                 api_message,
+                 None if settled_at is None else dt_to_text(settled_at),
+                 client_ref),
+            )
+
+    def load_pending_orders(self) -> list[dict[str, object]]:
+        """SENDING·ACCEPTED·UNKNOWN 상태의 주문. 재시작 복구가 결말을 확인한다."""
+        placeholders = ", ".join("?" for _ in self._PENDING_STATUSES)
+        rows = self._conn.execute(
+            f"SELECT * FROM order_log WHERE status IN ({placeholders}) ORDER BY id",
+            self._PENDING_STATUSES,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def realized_pnl_for_cycle(self, cycle_id: int) -> int:
+        """order_log 에서 집계한 실현손익 (H5).
+
+        도메인에는 이 값이 없고 있을 수 없다 — `after_sell` 이 `fill_price` 와
+        `fill_qty` 를 비우므로 단계 상태만으로는 계산할 수 없다(Plan 1 최종 리뷰
+        handover 7). 그래서 주문 이력이 유일한 근거다.
+
+        체결된 매도 금액 합에서 체결된 매수 금액 합을 뺀다. `PARTIAL` 도 센다 —
+        부분 체결된 수량은 실제로 오간 것이다. `path` 는 구분하지 않는다: 긴급청산
+        매도도 실현이다.
+
+        수수료와 세금은 포함하지 않는다. 설계서 1.3절이 세금 계산 자동화를
+        범위에서 배제했다.
+
+        **보유가 남은 사이클에도 값을 낸다.** 그때 이 값은 "지금까지 실현된 손익"
+        이며 최종값이 아니다. 사이클 종료 시점에 이 값을 `cycle.realized_pnl` 에
+        기록하는 것은 호출자(Plan 2B 의 엔진)의 몫이다.
+        """
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(CASE WHEN side = 'SELL' "
+            "                         THEN fill_price * fill_qty ELSE 0 END), 0) "
+            "     - COALESCE(SUM(CASE WHEN side = 'BUY' "
+            "                         THEN fill_price * fill_qty ELSE 0 END), 0) "
+            "       AS pnl "
+            "FROM order_log "
+            "WHERE cycle_id = ? AND status IN ('FILLED', 'PARTIAL') "
+            "  AND fill_price IS NOT NULL AND fill_qty IS NOT NULL",
+            (cycle_id,),
+        ).fetchone()
+        return int(row["pnl"])
