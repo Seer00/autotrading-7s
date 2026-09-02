@@ -28,6 +28,7 @@ source = [
   "autotrading7s.ports",
   "autotrading7s.engine",
   "autotrading7s.app",
+  "autotrading7s.cli",
 ]
 
 [tool.coverage.report]

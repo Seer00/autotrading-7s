@@ -42,7 +42,14 @@ from autotrading7s.domain import cycle as cycle_mod
 from autotrading7s.domain.cycle import Cycle
 from autotrading7s.domain.errors import DomainInvariantError
 from autotrading7s.domain.rules import BuyStage, TriggerParams, decide
-from autotrading7s.domain.types import CloseReason, CycleStatus, Tick, TickSource
+from autotrading7s.domain.stage import StageState
+from autotrading7s.domain.types import (
+    CloseReason,
+    CycleStatus,
+    StageStatus,
+    Tick,
+    TickSource,
+)
 from autotrading7s.engine.emergency import EmergencyHandler
 from autotrading7s.engine.executor import Executor
 from autotrading7s.engine.guards import GuardGate
@@ -195,9 +202,7 @@ class Orchestrator:
     async def _advance(self, cyc: Cycle, config: SplitConfig,
                        tick: Tick) -> None:
         if cyc.status is CycleStatus.STARTING:
-            ladder = config.to_ladder(anchor_price=tick.price)
-            self._repo.save_cycle(cycle_mod.confirm_anchor(
-                cyc, anchor_price=tick.price, ladder=ladder, at=tick.at))
+            self._confirm_anchor(cyc, config, tick)
             return
         # `accepts_triggers` 는 프로퍼티다 — 괄호를 붙이면 bool 을 호출한다.
         if not cyc.accepts_triggers:
@@ -236,6 +241,35 @@ class Orchestrator:
                          if s.stage_no == decision.stage_no)
             await self._executor.send(cycle=cyc, config=config, stage=stage,
                                       decision=decision, tick=tick)
+
+    def _confirm_anchor(self, cyc: Cycle, config: SplitConfig,
+                        tick: Tick) -> None:
+        """첫 틱의 가격으로 앵커와 사다리를 확정하고 **단계 행을 만든다**.
+
+        사다리는 계산될 뿐 저장되지 않는다 — `stage_state` 행 7개를 여기서
+        만들어야 `load_stages` 가 완전한 집합(H3)을 얻는다. 이것이 없으면
+        RUNNING 사이클이 로드 불가가 되어 첫 틱부터 격리된다.
+
+        **단계를 먼저 쓰고 사이클을 나중에 쓴다.** 그 사이에 프로세스가 죽었을
+        때 남는 상태가 다르다:
+
+        - 단계 먼저: STARTING 사이클 + 단계 행 → 다음 틱이 다시 확정하고
+          `save_stage` 가 WAITING → WAITING 으로 덮어쓴다(자기 치유).
+        - 사이클 먼저: RUNNING 사이클 + 단계 없음 → `load_stages` 가 거부하고
+          어느 경로로도 고칠 수 없다.
+
+        설계서 9절의 "잘못 기록된 쪽이 잘못 잊힌 쪽보다 항상 낫다" 와 같은
+        논리다 — 복구 가능한 쪽으로 어긋나게 한다.
+        """
+        ladder = config.to_ladder(anchor_price=tick.price)
+        for n in range(1, ladder.max_stages + 1):
+            self._repo.save_stage(cyc.cycle_id, StageState(
+                stage_no=n, status=StageStatus.WAITING,
+                trigger_price=ladder.trigger_price(n),
+                planned_qty=ladder.planned_qty(n),
+            ))
+        self._repo.save_cycle(cycle_mod.confirm_anchor(
+            cyc, anchor_price=tick.price, ladder=ladder, at=tick.at))
 
     # ── 미체결 감시 ─────────────────────────────────────────────────────
     async def poll_pending(self) -> None:
