@@ -22,7 +22,13 @@ addopts = "-q --strict-markers"
 asyncio_mode = "strict"
 
 [tool.coverage.run]
-source = ["autotrading7s.domain", "autotrading7s.adapters", "autotrading7s.ports"]
+source = [
+  "autotrading7s.domain",
+  "autotrading7s.adapters",
+  "autotrading7s.ports",
+  "autotrading7s.engine",
+  "autotrading7s.app",
+]
 
 [tool.coverage.report]
 fail_under = 95
