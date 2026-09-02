@@ -57,6 +57,28 @@ class OrderLogInvariantError(ValueError):
     """
 
 
+class StageInvariantError(ValueError):
+    """`save_stage` 갱신이 저장된 단계 이력의 불변식을 어길 때(Fix Round 4).
+
+    두 가지를 막는다: 이미 기록된 체결값(`fill_price`·`fill_qty`)을 다른
+    값으로 덮어쓰는 것, 도메인의 전이표(`domain.stage._ALLOWED`)가 허용하지
+    않는 상태 전이로 갱신하는 것. 도메인은 이 전이표를 `to_holding` 등
+    도우미를 거칠 때만 강제한다 — `StageState` 를 직접 만들어 넘기면
+    (이 프로젝트 이력에서 가장 흔한 결함 유형) 우회된다. `update_order_log`
+    가 `OrderLogInvariantError` 로 강화된 것과 같은 이유로, 저장소 경계가
+    최종 방어선이 된다.
+
+    `OrderLogInvariantError` 와 마찬가지로 `DomainInvariantError` 를
+    상속하지 **않는다**. `StageState.__post_init__` 이 이미 단일 객체의
+    필드 정합성(타입·양수 등)을 `DomainInvariantError` 로 강제하므로, 그와
+    구분한다 — 이 예외가 막는 것은 단일 객체의 내부 정합성이 아니라 "이
+    갱신이 이전에 저장된 행과 시계열로 맞는가" 라는 저장소 계층의 쓰기
+    순서 불변식이다. 두 예외를 섞으면 넓은 `except DomainInvariantError`
+    가 이 쓰기 순서 위반까지 삼켜, 어느 것이 손상되고 어느 것이 잘못된
+    호출인지 구분할 수 없게 된다.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class SplitConfig:
     """분할 설정 — 설계서 12.1절 `split_config`.
@@ -206,7 +228,16 @@ class RepositoryPort(Protocol):
         """
         ...
 
-    def save_stage(self, cycle_id: int, stage: StageState) -> None: ...
+    def save_stage(self, cycle_id: int, stage: StageState) -> None:
+        """(cycle_id, stage_no) 로 upsert 한다.
+
+        같은 단계에 이미 저장된 행이 있으면 `StageInvariantError` 를 낸다:
+        이미 기록된 `fill_price`·`fill_qty` 를 다른 non-null 값으로
+        덮어쓰거나, 도메인 전이표가 허용하지 않는 상태로 옮기려 할 때.
+        같은 상태로의 재저장(매 틱의 정상 흐름)과 같은 값의 재확인은
+        허용한다.
+        """
+        ...
 
     # ── 주문 이력과 실현손익 ────────────────────────────────────────────
     def append_order_log(

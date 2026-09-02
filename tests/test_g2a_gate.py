@@ -87,9 +87,15 @@ def test_the_full_cycle_survives_a_database_round_trip(repo):
             trigger_price=ladder.trigger_price(n),
             planned_qty=ladder.planned_qty(n)))
 
-    # 1단계 체결로 앵커를 확정한다.
+    # 1단계 체결로 앵커를 확정한다. 설계서 9절 ④·⑥ — BUY_PENDING 을 먼저
+    # 저장하고 커밋한 뒤에야 HOLDING 을 저장한다(Fix Round 4). 두 홉을
+    # 합성해 한 번만 저장하면 DB 관점에서 WAITING → HOLDING 단일 전이가
+    # 되어 도메인 전이표에 없는 도약이 된다 — save_stage 의 전이 합법성
+    # 가드가 정확히 그 생략을 잡는다.
     stages = repo.load_stages(cycle.cycle_id)
-    first = to_holding(to_buy_pending(stages[0]), fill_price=10_000,
+    first_pending = to_buy_pending(stages[0])
+    repo.save_stage(cycle.cycle_id, first_pending)
+    first = to_holding(first_pending, fill_price=10_000,
                        fill_qty=ladder.planned_qty(1), at=T0)
     repo.save_stage(cycle.cycle_id, first)
     cycle = confirm_anchor(cycle, anchor_price=10_000, ladder=ladder, at=T0)
@@ -114,15 +120,27 @@ def test_the_full_cycle_survives_a_database_round_trip(repo):
                 total_invested=invested_amount(live_stages),
                 total_limit=21_000_000, orders_last_minute=orders)
             index = decision.stage_no - 1
+            # 설계서 9절 ④·⑥ — 각 홉을 따로 저장한다(Fix Round 4). BUY_PENDING·
+            # SELL_PENDING 을 먼저 커밋해야 프로세스가 발주와 체결 사이에
+            # 죽어도 재시작 복구가 그 주문이 나가 있었다는 사실을 안다 —
+            # "잘못 기록된 쪽이 잘못 잊힌 쪽보다 항상 낫다"(설계서 9절 ③).
+            # to_holding(to_buy_pending(...)) 처럼 두 홉을 메모리에서 합성해
+            # 한 번만 저장하면 그 중간 상태가 DB 에 전혀 나타나지 않는다 —
+            # save_stage 의 전이 합법성 가드(Fix Round 4)가 그런 생략을
+            # WAITING → HOLDING 같은 도메인에 없는 단일 도약으로 보고 거부
+            # 한다. 이 주석을 지우고 "단순화" 하면 그 가드가 다시 열린다.
             if isinstance(decision, BuyStage):
                 assert check_buy(decision, ctx).allowed
-                updated = to_holding(to_buy_pending(live_stages[index]),
-                                     fill_price=decision.limit_price,
+                pending = to_buy_pending(live_stages[index])
+                repo.save_stage(cycle.cycle_id, pending)
+                updated = to_holding(pending, fill_price=decision.limit_price,
                                      fill_qty=decision.qty, at=at)
                 side = Side.BUY
             else:
                 assert check_sell(decision, ctx).allowed
-                updated = after_sell(to_sell_pending(live_stages[index]), at=at,
+                pending = to_sell_pending(live_stages[index])
+                repo.save_stage(cycle.cycle_id, pending)
+                updated = after_sell(pending, at=at,
                                      allow_rebuy=params.allow_rebuy)
                 side = Side.SELL
             repo.save_stage(cycle.cycle_id, updated)

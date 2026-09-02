@@ -32,10 +32,12 @@ from autotrading7s.ports.repository import (
     PendingOrderRow,
     RowNotFound,
     SplitConfig,
+    StageInvariantError,
 )
 from autotrading7s.domain.cycle import Cycle
 from autotrading7s.domain.stage import StageState
-from autotrading7s.domain.types import CycleStatus, OrderPath, Side
+from autotrading7s.domain.stage import _ALLOWED as _STAGE_TRANSITIONS
+from autotrading7s.domain.types import CycleStatus, OrderPath, Side, StageStatus
 
 
 class SqliteRepository:
@@ -153,6 +155,27 @@ class SqliteRepository:
         )
 
     def save_stage(self, cycle_id: int, stage: StageState) -> None:
+        """(cycle_id, stage_no) 로 upsert. 없는 행이면 그냥 만든다(초기 저장).
+
+        기존 행이 있으면 두 불변식을 지킨다(Fix Round 4 — `update_order_log`
+        와 같은 이유. `StageState` 는 직접 만들 수 있으므로, 도메인의
+        전이표는 `to_holding` 등 도우미를 거칠 때만 강제되고 그 도우미를
+        건너뛰면 우회된다 — 이 프로젝트 이력에서 가장 흔한 결함이 정확히
+        그 우회였다):
+
+        1. **체결값 불변.** 저장된 `fill_price`·`fill_qty` 가 non-null 이고
+           새 값도 non-null 이며 서로 다르면 `StageInvariantError`. 같은
+           값의 재확인과 `None`(값 지움, `after_sell` 이 하는 일)은 허용한다.
+        2. **전이 합법성.** 저장된 상태와 새 상태가 다르면, 그 전이가
+           `domain.stage._ALLOWED`(도메인이 이미 가진 표 — 여기서 다시
+           베끼면 둘이 어긋날 수 있다)에 있어야 한다. 같은 상태로의
+           재저장(매 틱의 정상 흐름)은 항상 허용한다.
+
+        `force_sold`(긴급청산 전용, 전이표를 의도적으로 우회한다)로 만든
+        `StageState` 를 이 메서드로 저장하는 경로는 아직 없다 — 그런 저장은
+        이 가드에 걸린다. Plan 2B 의 긴급청산 쓰기 경로가 이 메서드를 그대로
+        쓸지, 다른 경로를 둘지는 그 설계가 결정할 문제다.
+        """
         row = stage_to_row(cycle_id, stage)
         columns = ", ".join(row)
         placeholders = ", ".join(f":{k}" for k in row)
@@ -160,6 +183,32 @@ class SqliteRepository:
             f"{k} = :{k}" for k in row if k not in ("cycle_id", "stage_no")
         )
         with self._conn:
+            current = self._conn.execute(
+                "SELECT status, fill_price, fill_qty FROM stage_state "
+                "WHERE cycle_id = ? AND stage_no = ?",
+                (cycle_id, stage.stage_no),
+            ).fetchone()
+            if current is not None:
+                current_status = StageStatus(current["status"])
+                if stage.status is not current_status:
+                    allowed = _STAGE_TRANSITIONS.get(current_status, frozenset())
+                    if stage.status not in allowed:
+                        raise StageInvariantError(
+                            f"stage {stage.stage_no} of cycle {cycle_id}: "
+                            f"{current_status.value} → {stage.status.value} "
+                            "는 허용되지 않는 전이"
+                        )
+                for field in ("fill_price", "fill_qty"):
+                    stored = current[field]
+                    incoming = getattr(stage, field)
+                    if (stored is not None and incoming is not None
+                            and stored != incoming):
+                        raise StageInvariantError(
+                            f"stage {stage.stage_no} of cycle {cycle_id}: "
+                            f"{field} already {stored!r}; refusing to "
+                            f"overwrite with {incoming!r}"
+                        )
+
             self._conn.execute(
                 f"INSERT INTO stage_state ({columns}) VALUES ({placeholders}) "
                 f"ON CONFLICT(cycle_id, stage_no) DO UPDATE SET {updates}",
