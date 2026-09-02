@@ -10,6 +10,8 @@ from datetime import datetime
 from enum import Enum
 from uuid import UUID
 
+from autotrading7s.domain.errors import DomainInvariantError
+
 
 class Side(Enum):
     BUY = "BUY"
@@ -50,6 +52,13 @@ class CycleStatus(Enum):
 class CloseReason(Enum):
     NORMAL = "NORMAL"
     EMERGENCY = "EMERGENCY"
+    # D20 — 거래정지 등으로 정상 청산이 불가능해 잔량을 남긴 채 강제로 종료한
+    # 사이클. 스키마(설계서 12.1절, `cycle.close_reason` CHECK)가 이미 이 값을
+    # 허용하므로 매핑 계층(Plan 2A)이 저장된 행을 복원할 때 필요하다. 이 값을
+    # *만드는* 상태 전이(`force_close`)는 그것을 쓰는 Emergency Control
+    # Handler 와 함께 설계하기로 미뤄졌다(Plan 2B) — 이 멤버는 그 전이 없이도
+    # 이미 저장된 행을 왕복시키는 데 쓰인다.
+    FORCED = "FORCED"
 
 
 class FillState(Enum):
@@ -71,7 +80,7 @@ class Tick:
         if isinstance(self.price, bool) or not isinstance(self.price, int):
             raise TypeError(f"price must be int, not {type(self.price).__name__}")
         if self.price <= 0:
-            raise ValueError(f"price must be positive: {self.price}")
+            raise DomainInvariantError(f"price must be positive: {self.price}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,9 +103,9 @@ class LimitOrderRequest:
         if isinstance(self.price, bool) or not isinstance(self.price, int):
             raise TypeError(f"price must be int, not {type(self.price).__name__}")
         if self.qty <= 0:
-            raise ValueError(f"qty must be positive: {self.qty}")
+            raise DomainInvariantError(f"qty must be positive: {self.qty}")
         if self.price <= 0:
-            raise ValueError(f"price must be positive: {self.price}")
+            raise DomainInvariantError(f"price must be positive: {self.price}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,7 +125,7 @@ class MarketSellRequest:
         if isinstance(self.qty, bool) or not isinstance(self.qty, int):
             raise TypeError(f"qty must be int, not {type(self.qty).__name__}")
         if self.qty <= 0:
-            raise ValueError(f"qty must be positive: {self.qty}")
+            raise DomainInvariantError(f"qty must be positive: {self.qty}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,7 +136,23 @@ class OrderAck:
 
 
 @dataclass(frozen=True, slots=True)
+class CancelAck:
+    broker_order_id: str
+    canceled_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class OrderStatus:
+    """`BrokerPort.get_order`/`list_orders_today` 가 보고하는 주문 상태.
+
+    `filled_qty` 는 **누적값**이다 — 이 주문이 지금까지 체결한 총 수량이며,
+    직전 조회 이후의 증분이 아니다. `filled_price` 는 지금까지 모든 체결의
+    **수량가중평균가**다, 가장 최근 체결의 가격이 아니다. 이 값들을 증분·
+    최종가로 잘못 읽으면 원가가 실제보다 작게 잡혀 실현손익이 실제보다 크게
+    보인다 — `RepositoryPort.update_order_log`(`fill_qty`·`fill_price`)로
+    그대로 넘길 때 이 약속이 그쪽 계약과 일치해야 한다.
+    """
+
     client_ref: UUID
     broker_order_id: str
     state: FillState
@@ -157,7 +182,7 @@ class Holding:
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError(f"{name} must be int, not {type(value).__name__}")
             if value < 0:
-                raise ValueError(f"{name} must be non-negative: {value}")
+                raise DomainInvariantError(f"{name} must be non-negative: {value}")
 
 
 @dataclass(frozen=True, slots=True)

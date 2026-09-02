@@ -17,6 +17,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from autotrading7s.domain.cycle import Cycle
+from autotrading7s.domain.errors import DomainInvariantError
 # _require_int·_require_ratio 는 "금액은 int, 비율은 Decimal"(설계서 3.1절)을
 # 코드로 옮긴 것이며 ladder.py 에서 처음 필요해 거기에 있다. rules 는 이미
 # ladder 에 의존하므로 의존 방향이 새로 생기지 않는다 — 같은 관용구를 여기에
@@ -59,9 +60,11 @@ class TriggerParams:
             )
 
         if self.target_pct <= 0:
-            raise ValueError(f"target_pct must be positive: {self.target_pct}")
+            raise DomainInvariantError(f"target_pct must be positive: {self.target_pct}")
         if self.rebuy_cooldown_sec < 0:
-            raise ValueError(f"rebuy_cooldown_sec must be non-negative: {self.rebuy_cooldown_sec}")
+            raise DomainInvariantError(
+                f"rebuy_cooldown_sec must be non-negative: {self.rebuy_cooldown_sec}"
+            )
 
 
 def _check_decision_fields(decision: BuyStage | SellStage) -> None:
@@ -79,7 +82,7 @@ def _check_decision_fields(decision: BuyStage | SellStage) -> None:
         if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(f"{name} must be int, not {type(value).__name__}")
         if value <= 0:
-            raise ValueError(f"{name} must be positive: {value}")
+            raise DomainInvariantError(f"{name} must be positive: {value}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,7 +133,7 @@ def decide(
         seen: set[int] = set()
         for s in states:
             if s.stage_no in seen:
-                raise ValueError(f"Duplicate stage_no in states: {s.stage_no}")
+                raise DomainInvariantError(f"Duplicate stage_no in states: {s.stage_no}")
             seen.add(s.stage_no)
 
     # 규칙 4 — 장 운영시간 밖에서는 어떤 결정도 내리지 않는다.
@@ -143,7 +146,7 @@ def decide(
 
     # 검사 6: 사다리와 매개변수의 target_pct 일치 확인
     if cycle.ladder.target_pct != params.target_pct:
-        raise ValueError(f"target_pct mismatch: ladder has "
+        raise DomainInvariantError(f"target_pct mismatch: ladder has "
                         f"{cycle.ladder.target_pct}, "
                         f"params has {params.target_pct}")
 
@@ -183,7 +186,7 @@ def _eval_buy(
         # 숨으므로 — decide() 가 중복 stage_no 에 그러듯 — 예외를 던진다.
         expected = ladder.trigger_price(stage_no)
         if state.trigger_price != expected:
-            raise ValueError(
+            raise DomainInvariantError(
                 f"trigger_price mismatch on stage {stage_no}: state has "
                 f"{state.trigger_price}, ladder computes {expected}"
             )
