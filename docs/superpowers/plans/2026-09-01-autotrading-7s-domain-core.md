@@ -1452,7 +1452,12 @@ class IllegalCycleTransition(RuntimeError):
 
 _ALLOWED: dict[CycleStatus, frozenset[CycleStatus]] = {
     CycleStatus.IDLE: frozenset({CycleStatus.STARTING}),
-    CycleStatus.STARTING: frozenset({CycleStatus.RUNNING, CycleStatus.IDLE}),
+    # STARTING → LIQUIDATING: 설계서 4.2절이 긴급청산을 "어느 상태에서든"으로
+    # 규정한다. STARTING 은 1단계 매수 주문이 체결 대기 중인 상태이며, 급락 중이라면
+    # 사용자가 가장 절실하게 빠져나오려는 순간이다.
+    CycleStatus.STARTING: frozenset(
+        {CycleStatus.RUNNING, CycleStatus.IDLE, CycleStatus.LIQUIDATING}
+    ),
     CycleStatus.RUNNING: frozenset(
         {CycleStatus.PAUSED, CycleStatus.LIQUIDATING, CycleStatus.CLOSED}
     ),
@@ -1477,6 +1482,41 @@ class Cycle:
     close_reason: CloseReason | None = None
     started_at: datetime | None = None
     closed_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        """앵커·사다리 불변식.
+
+        RUNNING·PAUSED 는 둘 다 필수다. RUNNING 은 사다리를 실제로 읽는 유일한
+        상태이고(accepts_triggers 가 그것으로 게이트), PAUSED 는 RUNNING 에서만
+        도달하므로 항상 사다리를 갖는다.
+
+        LIQUIDATING 은 필수가 아니다 — STARTING → LIQUIDATING 이 허용되므로 앵커
+        확정 전에 청산이 시작될 수 있다. 다만 앵커가 있으면 사다리도 있어야 하고
+        일치해야 한다.
+
+        일치 검사를 여기에 두는 이유는 confirm_anchor 의 호출부 검사만으로는
+        직접 생성(Plan 2 의 SQLite 행 복원)을 막지 못하기 때문이다.
+        """
+        if self.status in (CycleStatus.RUNNING, CycleStatus.PAUSED):
+            if self.anchor_price is None:
+                raise ValueError(
+                    f"Cycle status {self.status.value} requires anchor_price, got None"
+                )
+            if self.ladder is None:
+                raise ValueError(
+                    f"Cycle status {self.status.value} requires ladder, got None"
+                )
+        if self.anchor_price is not None and self.ladder is not None:
+            if self.anchor_price != self.ladder.anchor_price:
+                raise ValueError(
+                    f"anchor_price {self.anchor_price} != "
+                    f"ladder.anchor_price {self.ladder.anchor_price}"
+                )
+        if self.status is CycleStatus.LIQUIDATING and self.anchor_price is not None:
+            if self.ladder is None:
+                raise ValueError(
+                    "Cycle status LIQUIDATING with anchor_price requires ladder, got None"
+                )
 
     @property
     def is_active(self) -> bool:
@@ -1546,8 +1586,30 @@ def begin_liquidation(cycle: Cycle) -> Cycle:
     return replace(cycle, status=CycleStatus.LIQUIDATING)
 
 
-def close(cycle: Cycle, *, reason: CloseReason, at: datetime) -> Cycle:
+def close(
+    cycle: Cycle, *, reason: CloseReason, at: datetime, states: Sequence[StageState]
+) -> Cycle:
+    """사이클 종료. 보유가 남아 있으면 거부한다.
+
+    states 를 선택 인자로 두면 기본값이 "검사 없음"이 되어 안전장치가 아니다.
+    reason=EMERGENCY 에도 같은 검사를 적용한다 — 긴급청산이 부분 체결되면
+    (설계서 11절 result=PARTIAL) 보유가 남으므로 CLOSED 로 표시해서는 안 된다.
+    그러면 내부 기록과 실계좌가 갈라진다(설계서 10.2절).
+    """
     _guard(cycle, CycleStatus.CLOSED)
+    if not is_cycle_complete(states):
+        # 거부 사유를 구분한다. held_qty 는 PENDING 상태에서 0이므로, 사유가
+        # 미체결 주문일 때 수량만 말하면 "0주 보유 중"이라는 모순된 메시지가 된다.
+        pending = (StageStatus.BUY_PENDING, StageStatus.SELL_PENDING)
+        pending_stages = [s.stage_no for s in states if s.status in pending]
+        if pending_stages:
+            raise ValueError(
+                f"cannot close cycle — pending orders on stages: {pending_stages}"
+            )
+        held = sum(s.held_qty for s in states)
+        raise ValueError(
+            f"cannot close cycle with {held} shares still held — not all stages complete"
+        )
     return replace(cycle, status=CycleStatus.CLOSED, close_reason=reason, closed_at=at)
 
 
@@ -1556,7 +1618,14 @@ def is_cycle_complete(states: Sequence[StageState]) -> bool:
 
     설계서 4.2절은 '보유수량 0 도달'을 종료 조건으로 규정한다. PENDING 주문이
     남아 있으면 곧 보유가 생길 수 있으므로 종료로 보지 않는다.
+
+    빈 시퀀스는 데이터 정합성 실패다. all() 이 빈 시퀀스에서 True 를 반환하므로,
+    검사 없이 두면 단계 로드 실패가 "사이클 완료"로 번역되어 주식을 보유한
+    사이클이 닫힌다. False 반환은 문제를 숨긴 채 사이클을 영구히 미완료로
+    남기므로, 조용한 정지보다 시끄러운 오류를 택한다.
     """
+    if not states:
+        raise ValueError("stage states sequence is empty — data integrity failure")
     pending = (StageStatus.BUY_PENDING, StageStatus.SELL_PENDING)
     if any(s.status in pending for s in states):
         return False
@@ -3222,6 +3291,7 @@ Plan 1 완료 시 다음이 모두 통과해야 한다.
 - [ ] 규칙 5 — PENDING 제외
 - [ ] 단계 상태 전이 전수 + 불법 전이 거부
 - [ ] 사이클 상태 전이 전수 + 불법 전이 거부
+- [ ] 사이클 안전장치 — 앵커·사다리 불변식, 빈 단계 목록 거부, 보유 중 종료 거부, 긴급청산이 STARTING 에서도 가능, LIQUIDATING 일방향 래칫
 - [ ] 사다리 설정 검증 — 마지막 단계 원시 발동가 1원 하한(양방향 경계), total_drop == 1 경계
 - [ ] guards 전항목 — 한도 경계값, 1주 미달, 빈도 제한
 - [ ] 평가·실현손익 계산 (설계서 14.1절 목업 수치 고정)
