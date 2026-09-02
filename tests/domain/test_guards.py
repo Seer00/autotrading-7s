@@ -152,7 +152,7 @@ def test_allows_total_limit_below_stock_limit():
     assert c.total_limit < c.stock_limit
 
 
-### 결정 타입(BuyStage·SellStage)의 불변식 — guards 의 직접 입력이다.
+# 결정 타입(BuyStage·SellStage)의 불변식 — guards 의 직접 입력이다.
 
 
 @pytest.mark.parametrize("decision_type", [BuyStage, SellStage])

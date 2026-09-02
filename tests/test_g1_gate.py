@@ -108,7 +108,10 @@ def test_full_cycle_down_then_up_closes_at_zero_holdings():
         assert [d.stage_no for d in step(price)] != []
 
     assert [s.status for s in states[:4]] == [StageStatus.HOLDING] * 4
-    assert held_qty(states) == sum(lad.planned_qty(n) for n in range(1, 5))
+    # 1~4단계 수량을 문자 그대로 고정한다. sum(lad.planned_qty(n)) 로 다시
+    # 유도하면 판정에 쓰인 것과 같은 메서드로 기댓값을 만들어, 배관만 확인하고
+    # 숫자는 확인하지 못한다. (100 + 105 + 111 + 117 = 433)
+    assert held_qty(states) == 433
 
     # 반등 — 낮은 단계가 먼저 정리된다.
     sold_order: list[int] = []

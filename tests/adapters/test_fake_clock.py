@@ -9,7 +9,10 @@ T0 = datetime(2026, 9, 1, 9, 30, tzinfo=timezone.utc)
 
 
 def test_fake_clock_satisfies_port():
+    """포트 준수는 런타임에 확인한다 — 이 프로젝트에는 타입 검사기가 없으므로
+    타입 주석만으로는 아무것도 검증되지 않는다."""
     clock: ClockPort = FakeClock(current=T0)
+    assert isinstance(clock, ClockPort)
     assert clock.now() == T0
     assert clock.is_market_open() is True
 

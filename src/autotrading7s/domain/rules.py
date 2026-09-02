@@ -183,9 +183,12 @@ def _eval_buy(
                 continue
         if tick.price > state.trigger_price:
             continue
+        # 수량은 사다리에서 매번 다시 계산한다. Ladder.__post_init__ 이
+        # 1단계에서 1주 이상 살 수 있음을 확인하고 발동가는 단계가 올라갈수록
+        # 낮아지므로 planned_qty 는 항상 1 이상이다. 만약 그 불변식이 깨지면
+        # BuyStage 가 "qty must be positive" 로 터진다 — 조용히 건너뛰는 것보다
+        # 낫다.
         qty = ladder.planned_qty(stage_no)
-        if qty <= 0:
-            continue
         return BuyStage(
             stage_no=stage_no,
             # 지정가는 관측된 현재가로 발주한다. 미체결이면 3초 후 취소하고
@@ -213,9 +216,11 @@ def _eval_sells(
         # 규칙 5 — SELL_PENDING 은 이미 주문이 나갔다.
         if state.status is not StageStatus.HOLDING:
             continue
-        if state.fill_price is None or not state.fill_qty:
-            continue
-        target = target_price(state.fill_price, params.target_pct)
+        # 체결가·수량을 다시 확인하지 않는다 — HOLDING 이면
+        # StageState.__post_init__ 이 둘 다 양의 int 임을 보장한다. 그 불변식이
+        # 깨지면 target_price 가 TypeError 로 터진다. 손절매가 없는 전략에서
+        # 매도를 조용히 건너뛰는 분기는 두면 안 된다.
+        target = target_price(state.fill_price, params.target_pct)  # type: ignore[arg-type]
         if tick.price < target:
             continue
         out.append(

@@ -22,3 +22,6 @@ addopts = "-q --strict-markers"
 
 [tool.coverage.run]
 source = ["autotrading7s.domain"]
+
+[tool.coverage.report]
+fail_under = 95

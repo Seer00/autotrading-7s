@@ -79,8 +79,11 @@ def test_abort_start_returns_to_idle():
      CycleStatus.LIQUIDATING, CycleStatus.CLOSED],
 )
 def test_only_running_accepts_triggers(status: CycleStatus):
-    """FINDING F3: 모든 non-RUNNING 상태는 유효한 anchor/ladder가 있어도 triggers를 거부한다."""
-    # FINDING F3: 모든 상태에 anchor와 ladder를 제공하여 stronger assertion
+    """RUNNING 만 트리거 판정을 받는다 — 사다리가 있어도 상태가 결정한다.
+
+    앵커와 사다리를 모두 갖춘 사이클로 검사한다. 필드가 없어서 거부되는
+    것이 아니라 상태 때문에 거부된다는 것을 보이려는 것이다.
+    """
     cyc = Cycle(cycle_id=1, config_id=1, seq=1, status=status,
                 anchor_price=10_000, ladder=ladder())
     assert cyc.accepts_triggers is False
@@ -99,7 +102,7 @@ def test_liquidation_from_running_and_paused():
 
 
 def test_close_records_reason_and_time():
-    """FINDING C: close()는 이제 완료된 단계 목록을 요구한다."""
+    """정상 종료는 사유와 시각을 남긴다 — 종료 조건을 만족한 단계 목록이 필요하다."""
     cyc = close(running(), reason=CloseReason.NORMAL, at=T0, states=complete_stages())
     assert cyc.status is CycleStatus.CLOSED
     assert cyc.close_reason is CloseReason.NORMAL
@@ -107,16 +110,15 @@ def test_close_records_reason_and_time():
 
 
 def test_close_from_liquidating_records_emergency():
-    """FINDING C: close()는 이제 완료된 단계 목록을 요구한다."""
+    """긴급청산을 거쳐 종료하면 사유가 EMERGENCY 로 남는다 — 설계서 12.2절."""
     cyc = close(begin_liquidation(running()), reason=CloseReason.EMERGENCY, at=T0,
                 states=complete_stages())
     assert cyc.close_reason is CloseReason.EMERGENCY
 
 
 def test_paused_can_be_closed():
-    """외부에서 수동 전량 매도된 종목은 PAUSED 에서 종료할 수 있어야 한다.
-    FINDING C: close()는 이제 완료된 단계 목록을 요구한다.
-    """
+    """외부에서 수동 전량 매도된 종목은 PAUSED 에서 종료할 수 있어야 한다
+    (설계서 10.2절). 보유가 0 이므로 종료 조건을 만족한다."""
     assert close(pause(running()), reason=CloseReason.NORMAL, at=T0,
                  states=complete_stages()).status is CycleStatus.CLOSED
 
@@ -137,7 +139,11 @@ def test_paused_can_be_closed():
     ],
 )
 def test_illegal_cycle_transitions(status: CycleStatus, action: str):
-    """FINDING A: RUNNING과 LIQUIDATING 상태는 anchor_price와 ladder가 필수."""
+    """전이표에 없는 전이는 거부된다 — 설계서 4.2절.
+
+    RUNNING·LIQUIDATING 케이스는 앵커와 사다리를 갖춰 구성한다. 그 상태의
+    필드 불변식이 요구하기 때문이며, 전이 거부와는 별개다.
+    """
     if status in (CycleStatus.RUNNING, CycleStatus.LIQUIDATING):
         cyc = Cycle(cycle_id=1, config_id=1, seq=1, status=status,
                     anchor_price=10_000, ladder=ladder())
@@ -177,94 +183,100 @@ def test_is_cycle_not_complete_while_pending():
     assert is_cycle_complete(states) is False
 
 
-# FINDING A: Cycle 불변량 검사 테스트
+# 상태별 필드 불변식 — 사다리 없이 판정할 수 있는 상태는 없다.
+
 def test_cycle_running_requires_anchor_price():
-    """FINDING A: RUNNING 상태는 anchor_price가 필수."""
+    """RUNNING 은 앵커가 있어야 한다 — 사다리 전체가 앵커에서 파생된다."""
     with pytest.raises(ValueError, match="requires anchor_price"):
         Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.RUNNING,
               ladder=ladder())
 
 
 def test_cycle_running_requires_ladder():
-    """FINDING A: RUNNING 상태는 ladder가 필수."""
+    """RUNNING 은 사다리가 있어야 한다 — 없으면 발동가를 계산할 수 없다."""
     with pytest.raises(ValueError, match="requires ladder"):
         Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.RUNNING,
               anchor_price=10_000)
 
 
 def test_cycle_running_anchor_ladder_must_match():
-    """FINDING A: RUNNING의 anchor_price와 ladder.anchor_price가 일치해야 한다."""
+    """RUNNING 의 앵커와 사다리의 앵커가 다르면 어느 쪽이 진실인지 알 수 없다."""
     with pytest.raises(ValueError, match="anchor_price .* != ladder.anchor_price"):
         Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.RUNNING,
               anchor_price=9_000, ladder=ladder(anchor=10_000))
 
 
 def test_cycle_paused_requires_anchor_price():
-    """FINDING A: PAUSED 상태는 anchor_price가 필수."""
+    """PAUSED 도 앵커가 있어야 한다 — resume 으로 판정을 재개할 수 있다."""
     with pytest.raises(ValueError, match="requires anchor_price"):
         Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.PAUSED,
               ladder=ladder())
 
 
 def test_cycle_paused_requires_ladder():
-    """FINDING A: PAUSED 상태는 ladder가 필수."""
+    """PAUSED 도 사다리가 있어야 한다 — 보유는 유지되고 판정만 멈춘 상태다."""
     with pytest.raises(ValueError, match="requires ladder"):
         Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.PAUSED,
               anchor_price=10_000)
 
 
 def test_cycle_paused_anchor_ladder_mismatch():
-    """FINDING A: PAUSED에서도 anchor/ladder 미스매치는 거부된다."""
+    """PAUSED 에서도 앵커/사다리 불일치는 거부된다."""
     with pytest.raises(ValueError, match="anchor_price .* != ladder.anchor_price"):
         Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.PAUSED,
               anchor_price=9_340, ladder=ladder(anchor=10_000))
 
 
 def test_cycle_liquidating_from_starting_allows_no_fields():
-    """FINDING D: LIQUIDATING은 STARTING에서 (사용자 긴급 취소) anchor/ladder 없이도 가능."""
+    """LIQUIDATING 은 앵커 없이도 성립한다 — 청산은 앵커가 확정되기 전인
+    STARTING 에서도 시작할 수 있다(설계서 11.1절)."""
     cyc = Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.LIQUIDATING)
     assert cyc.anchor_price is None
     assert cyc.ladder is None
 
 
 def test_cycle_liquidating_with_anchor_requires_matching_ladder():
-    """FINDING A: LIQUIDATING이 anchor_price를 가지면 ladder도 필수이고 일치해야 한다."""
+    """앵커가 있으면 사다리도 있어야 한다 — 둘은 같은 순간에 확정된다."""
     with pytest.raises(ValueError, match="requires ladder"):
         Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.LIQUIDATING,
               anchor_price=10_000)
 
 
 def test_cycle_idle_allows_no_fields():
-    """FINDING A: IDLE 상태는 anchor와 ladder가 없어도 된다."""
+    """IDLE 은 아직 아무것도 시작하지 않은 상태다 — 앵커도 사다리도 없다."""
     cyc = Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.IDLE)
     assert cyc.anchor_price is None
     assert cyc.ladder is None
 
 
 def test_cycle_starting_allows_no_fields():
-    """FINDING A: STARTING 상태는 anchor와 ladder가 없어도 된다."""
+    """STARTING 은 1단계 체결을 기다리는 구간이므로 앵커가 아직 없다."""
     cyc = Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.STARTING)
     assert cyc.anchor_price is None
     assert cyc.ladder is None
 
 
-# FINDING B: is_cycle_complete 공백 검사 테스트
 def test_is_cycle_complete_empty_raises():
-    """FINDING B: 빈 단계 리스트는 데이터 무결성 실패를 나타내므로 ValueError를 던진다."""
+    """빈 단계 리스트는 데이터 무결성 실패다 — "종료됨"으로 답하지 않는다.
+
+    단계가 없는 사이클은 존재할 수 없다. True 를 돌려주면 보유를 추적하는
+    주체 없이 사이클이 닫힌다.
+    """
     with pytest.raises(ValueError, match="stage states sequence is empty"):
         is_cycle_complete([])
 
 
-# FINDING C: close() 검증 테스트
+# close() 는 종료 조건을 실제로 확인한다.
+
 def test_close_rejects_incomplete_cycle():
-    """FINDING C: close()는 보유 주식이 있으면 거부한다."""
+    """보유 주식이 남아 있으면 종료할 수 없다 — 남은 수량을 메시지에 남긴다."""
     incomplete_states = [_stage(1, StageStatus.SOLD), _stage(2, StageStatus.HOLDING, qty=100)]
     with pytest.raises(ValueError, match="100 shares still held"):
         close(running(), reason=CloseReason.NORMAL, at=T0, states=incomplete_states)
 
 
 def test_close_emergency_also_checks_holdings():
-    """FINDING C: 긴급청산 종료도 보유 주식을 확인한다."""
+    """긴급청산 종료도 예외가 아니다 — 청산이 다 끝났는지 확인한다."""
     incomplete_states = [_stage(1, StageStatus.SOLD), _stage(2, StageStatus.HOLDING, qty=50)]
     with pytest.raises(ValueError, match="50 shares still held"):
         close(begin_liquidation(running()), reason=CloseReason.EMERGENCY, at=T0,
@@ -272,15 +284,16 @@ def test_close_emergency_also_checks_holdings():
 
 
 def test_close_with_pending_orders_fails():
-    """FINDING F4: PENDING 주문이 있으면 사이클을 종료할 수 없다."""
+    """PENDING 주문이 남아 있으면 종료할 수 없다 — 곧 보유가 생길 수 있다."""
     incomplete_states = [_stage(1, StageStatus.SOLD), _stage(2, StageStatus.BUY_PENDING)]
     with pytest.raises(ValueError, match="pending orders"):
         close(running(), reason=CloseReason.NORMAL, at=T0, states=incomplete_states)
 
 
-# FINDING D: begin_liquidation from STARTING 테스트
+# 긴급청산을 시작할 수 있는 상태.
+
 def test_begin_liquidation_from_starting():
-    """FINDING D: 긴급청산은 STARTING 상태에서도 가능해야 한다 (사용자 중단)."""
+    """1단계 주문이 나간 뒤 사용자가 중단할 수 있어야 한다 — 설계서 11.1절."""
     cyc = start(idle(), at=T0)
     assert cyc.status is CycleStatus.STARTING
     liq_cyc = begin_liquidation(cyc)
@@ -288,13 +301,13 @@ def test_begin_liquidation_from_starting():
 
 
 def test_begin_liquidation_still_refuses_idle():
-    """FINDING D: 긴급청산은 IDLE에서는 여전히 거부된다 (청산할 포지션 없음)."""
+    """IDLE 에서는 거부된다 — 청산할 포지션도 진행 중인 주문도 없다."""
     with pytest.raises(IllegalCycleTransition):
         begin_liquidation(idle())
 
 
 def test_begin_liquidation_still_refuses_closed():
-    """FINDING D: 긴급청산은 CLOSED에서는 여전히 거부된다."""
+    """CLOSED 는 종단 상태다 — 이미 끝난 사이클을 다시 청산할 수 없다."""
     with pytest.raises(IllegalCycleTransition):
         begin_liquidation(
             Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.CLOSED)
@@ -302,7 +315,7 @@ def test_begin_liquidation_still_refuses_closed():
 
 
 def test_begin_liquidation_still_refuses_from_liquidating():
-    """FINDING D: 긴급청산은 LIQUIDATING에서 거부된다 (이중 요청 방지)."""
+    """이미 청산 중이면 거부된다 — 이중 청산 주문을 막는다."""
     cyc = Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.LIQUIDATING,
                 anchor_price=10_000, ladder=ladder())
     with pytest.raises(IllegalCycleTransition):

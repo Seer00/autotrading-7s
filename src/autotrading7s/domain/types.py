@@ -139,9 +139,25 @@ class OrderStatus:
 
 @dataclass(frozen=True, slots=True)
 class Holding:
+    """계좌 잔고의 한 종목.
+
+    ``qty`` 는 ``Balance.qty_of`` 를 거쳐 ``MarketSellRequest.qty`` 로
+    흘러간다. 설계서 11.1절은 긴급청산 수량을 실제 계좌에서 가져오라고
+    요구하므로, 이 타입이 그 수량의 경계다. 전량 매도된 종목이 0주로 남아
+    오는 것은 정상이라 0 을 허용한다.
+    """
+
     code: str
     qty: int
     avg_price: int
+
+    def __post_init__(self) -> None:
+        for name in ("qty", "avg_price"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be int, not {type(value).__name__}")
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative: {value}")
 
 
 @dataclass(frozen=True, slots=True)

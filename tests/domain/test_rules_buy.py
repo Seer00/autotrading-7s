@@ -156,120 +156,126 @@ def test_reason_records_rest_poll_source():
     assert "tick=9500(REST_POLL)" in d.reason
 
 
-# Finding 1: Wrong instrument detection
+# 다른 종목의 틱은 판정에 들어갈 수 없다.
+
 def test_wrong_stock_code_raises_value_error():
-    """FINDING 1: decide() must detect a tick for the wrong instrument."""
+    """다른 종목의 틱으로 판정하면 남의 가격으로 이 종목을 주문한다."""
     lad = ladder()
     with pytest.raises(ValueError) as exc_info:
         run(9_500, fresh_states(lad), stock_code="035720")
-    assert "005930" in str(exc_info.value)
-    assert "035720" in str(exc_info.value)
+    assert str(exc_info.value) == (
+        "Tick code mismatch: tick has '005930', but stock_code is '035720'"
+    )
 
 
 def test_wrong_stock_code_raises_even_when_market_closed():
-    """FINDING 1: Stock code check happens before market_open gate."""
+    """종목 불일치는 프로그래밍 오류이므로 장 운영시간 게이트보다 먼저 난다."""
     lad = ladder()
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Tick code mismatch"):
         run(9_500, fresh_states(lad), market_open=False, stock_code="035720")
 
 
 def test_matching_stock_code_still_works():
-    """FINDING 1: Matching code proceeds normally."""
+    """종목이 일치하면 정상 판정한다."""
     lad = ladder()
     decisions = run(9_500, fresh_states(lad), stock_code="005930")
     assert len(decisions) == 1
 
 
-# Finding 2: Tick price validation
+# 틱 가격의 불변식.
+
 def test_tick_price_zero_raises_value_error():
-    """FINDING 2: Tick price must be positive."""
+    """가격 0 은 증권사 API 에서 시장가의 전선 표현이다 — 시세로 받지 않는다."""
     with pytest.raises(ValueError) as exc_info:
         Tick(code="005930", price=0, at=T0, source=TickSource.WS)
-    assert "positive" in str(exc_info.value).lower() or "0" in str(exc_info.value)
+    assert str(exc_info.value) == "price must be positive: 0"
 
 
 def test_tick_price_negative_raises_value_error():
-    """FINDING 2: Tick price must be positive."""
+    """음수 시세는 존재하지 않는다."""
     with pytest.raises(ValueError) as exc_info:
         Tick(code="005930", price=-5000, at=T0, source=TickSource.WS)
-    assert "positive" in str(exc_info.value).lower() or "-5000" in str(exc_info.value)
+    assert str(exc_info.value) == "price must be positive: -5000"
 
 
 def test_tick_price_float_raises_type_error():
-    """FINDING 2: Tick price must be int, not float."""
+    """float 시세는 발동가 비교와 금액 산술을 오염시킨다 — 설계서 3.1절."""
     with pytest.raises(TypeError) as exc_info:
         Tick(code="005930", price=9340.5, at=T0, source=TickSource.WS)
-    assert "int" in str(exc_info.value).lower()
+    assert str(exc_info.value) == "price must be int, not float"
 
 
 def test_tick_price_bool_raises_type_error():
-    """FINDING 2: bool is rejected even though it's technically an int subclass."""
+    """bool 은 int 의 하위 클래스지만 거절한다."""
     with pytest.raises(TypeError) as exc_info:
         Tick(code="005930", price=True, at=T0, source=TickSource.WS)
-    assert "int" in str(exc_info.value).lower()
+    assert str(exc_info.value) == "price must be int, not bool"
 
 
-# Finding 3: Duplicate stage_no detection
+# 상태 목록의 중복 단계 감지.
+
 def test_duplicate_stage_no_raises_value_error():
-    """FINDING 3: Passing states with two entries for same stage_no raises ValueError."""
+    """같은 단계가 두 번 담긴 목록은 손상이다 — 어느 쪽이 진실인지 알 수 없다."""
     lad = ladder()
     states = fresh_states(lad)
-    # Add a duplicate entry for stage 2
     states.append(
         StageState(stage_no=2, status=StageStatus.WAITING,
                    trigger_price=9_500, planned_qty=105)
     )
     with pytest.raises(ValueError) as exc_info:
         run(9_500, states)
-    assert "2" in str(exc_info.value) or "duplicate" in str(exc_info.value).lower()
+    assert str(exc_info.value) == "Duplicate stage_no in states: 2"
 
 
 def test_duplicate_stage_no_raises_even_when_market_closed():
-    """FINDING 3: Duplicate check happens before market_open gate."""
+    """중복 검사도 장 운영시간 게이트보다 먼저 난다."""
     lad = ladder()
     states = fresh_states(lad)
     states.append(
         StageState(stage_no=2, status=StageStatus.WAITING,
                    trigger_price=9_500, planned_qty=105)
     )
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Duplicate stage_no"):
         run(9_500, states, market_open=False)
 
 
-# Finding 5: TriggerParams validation
+# TriggerParams 의 불변식.
+
 def test_trigger_params_zero_target_pct_raises():
-    """FINDING 5: target_pct must be positive."""
+    """목표율 0 이면 목표가가 체결가와 같아져 수수료만 태우고 회전한다."""
     with pytest.raises(ValueError) as exc_info:
         TriggerParams(target_pct=Decimal("0"))
-    assert "positive" in str(exc_info.value).lower() or "0" in str(exc_info.value)
+    assert str(exc_info.value) == "target_pct must be positive: 0"
 
 
 def test_trigger_params_negative_target_pct_raises():
-    """FINDING 5: target_pct must be positive."""
+    """음수 목표율은 손실 가격에 매도를 걸게 된다."""
     with pytest.raises(ValueError) as exc_info:
         TriggerParams(target_pct=Decimal("-0.05"))
-    assert "positive" in str(exc_info.value).lower()
+    assert str(exc_info.value) == "target_pct must be positive: -0.05"
 
 
 def test_trigger_params_negative_cooldown_raises():
-    """FINDING 5: rebuy_cooldown_sec must be non-negative."""
+    """음수 쿨다운은 쿨다운이 없는 것과 같다 — 설정 실수를 조용히 넘기지 않는다."""
     with pytest.raises(ValueError) as exc_info:
         TriggerParams(target_pct=FIVE, rebuy_cooldown_sec=-1)
-    assert "non-negative" in str(exc_info.value).lower() or "-1" in str(exc_info.value)
+    assert str(exc_info.value) == "rebuy_cooldown_sec must be non-negative: -1"
 
 
 def test_trigger_params_valid_defaults_construct():
-    """FINDING 5: Valid defaults still work."""
+    """기본값(재매수 허용, 쿨다운 60초)은 그대로 구성된다."""
     params = TriggerParams(target_pct=FIVE)
     assert params.target_pct == FIVE
     assert params.allow_rebuy is True
     assert params.rebuy_cooldown_sec == 60
 
 
-# Finding 6: target_pct mismatch between ladder and params
+# 사다리와 매개변수의 목표율은 같은 값이어야 한다.
+
 def test_target_pct_mismatch_raises():
-    """FINDING 6: Ladder and params target_pct must match."""
-    lad_5pct = ladder(anchor=10_000)  # Has 5% target_pct
+    """같은 값이 두 곳에 저장되므로 판정 전에 대조한다 — 사다리는 사이클에
+    박제되고 매개변수는 설정에서 다시 읽히므로 어긋날 수 있다."""
+    lad_5pct = ladder(anchor=10_000)
     cycle = running_cycle(lad_5pct)
 
     params_3pct = TriggerParams(target_pct=Decimal("0.03"))
@@ -278,11 +284,13 @@ def test_target_pct_mismatch_raises():
         decide(tick=tick(9_500), cycle=cycle, states=fresh_states(lad_5pct),
                params=params_3pct, now=T0, market_open=True, stock_code="005930")
 
-    assert "5%" in str(exc_info.value) or "3%" in str(exc_info.value) or "target_pct" in str(exc_info.value).lower()
+    assert str(exc_info.value) == (
+        "target_pct mismatch: ladder has 0.05, params has 0.03"
+    )
 
 
 def test_target_pct_match_proceeds():
-    """FINDING 6: Matching target_pct proceeds normally."""
+    """일치하면 정상 판정한다."""
     lad = ladder()  # 5%
     cycle = running_cycle(lad)
     params = TriggerParams(target_pct=FIVE)  # 5%
@@ -336,7 +344,7 @@ def test_partial_states_list_stays_legal():
 
 
 def test_starting_cycle_with_mismatched_target_pct_returns_empty():
-    """FINDING 6: STARTING cycle returns [] before mismatch check (gate 4 fires first)."""
+    """STARTING 은 사다리가 없어 목표율 대조 이전에 빈 목록으로 끝난다."""
     idle = Cycle(cycle_id=1, config_id=1, seq=1, status=CycleStatus.IDLE)
     starting = start(idle, at=T0)
     lad = ladder()

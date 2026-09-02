@@ -152,10 +152,15 @@ def begin_liquidation(cycle: Cycle) -> Cycle:
 def close(
     cycle: Cycle, *, reason: CloseReason, at: datetime, states: Sequence[StageState]
 ) -> Cycle:
-    """사이클을 종료 상태로 전이. FINDING C: 사이클이 실제로 종료되었음을 검증."""
+    """사이클을 종료 상태로 전이. 실제로 종료 조건을 만족했는지 확인한다.
+
+    단계 목록을 요구하는 이유는 상태 전이만으로는 종료를 판단할 수 없기
+    때문이다 — 보유 주식이나 진행 중인 주문이 남은 채 CLOSED 로 넘어가면
+    그 포지션을 추적하는 주체가 사라진다.
+    """
     _guard(cycle, CycleStatus.CLOSED)
     if not is_cycle_complete(states):
-        # FINDING F4: PENDING 주문과 보유 주식을 구분하여 메시지 작성
+        # PENDING 주문과 보유 주식은 원인이 다르므로 메시지를 구분한다.
         pending = (StageStatus.BUY_PENDING, StageStatus.SELL_PENDING)
         pending_stages = [s.stage_no for s in states if s.status in pending]
         if pending_stages:
@@ -175,7 +180,8 @@ def is_cycle_complete(states: Sequence[StageState]) -> bool:
     설계서 4.2절은 '보유수량 0 도달'을 종료 조건으로 규정한다. PENDING 주문이
     남아 있으면 곧 보유가 생길 수 있으므로 종료로 보지 않는다.
 
-    FINDING B: 빈 단계 리스트는 데이터 무결성 실패다. ValueError를 던진다.
+    빈 단계 리스트는 데이터 무결성 실패다 — 단계가 없는 사이클은 존재할 수
+    없으므로 "종료됨"으로 답하지 않고 ValueError 를 던진다.
     """
     if not states:
         raise ValueError("stage states sequence is empty — data integrity failure")

@@ -118,6 +118,31 @@ def test_rule5_excludes_non_holding_from_sell(status: StageStatus):
     assert run(11_000, states, lad) == []
 
 
+def test_no_sell_on_decline_however_deep():
+    """자동 손절매 배제 — 설계서 6절.
+
+    `decide()` 에 하락 조건 매도 분기가 없다는 것은 이 브랜치의 세 구조적
+    제약 중 하나다. 나머지 둘(신용 필드 부재, 시장가 표현 불가)은
+    test_types.py 가 타입 구조로 확인하지만, 이 제약은 구조로 확인할 수
+    없다 — 없는 분기를 볼 수는 없으므로 행동으로 못박는다.
+
+    여러 단계를 보유한 채 모든 체결가를 크게 밑도는 틱이 와도 결정은 없다.
+    평단 관리는 물타기(추가 매수)로 하며, 이 틱에서 매수가 나오지 않는 것은
+    발동가보다 낮은 단계가 모두 이미 채워졌기 때문이다.
+    """
+    lad = ladder()
+    states = [
+        stage(lad, n, StageStatus.HOLDING,
+              fill_price=lad.trigger_price(n), fill_qty=lad.planned_qty(n))
+        for n in range(1, 8)
+    ]
+    # 7단계 체결가(7,000원)의 절반 — 어떤 단계도 목표가에 닿지 않았고,
+    # 손절 기준선이라 부를 만한 값에는 전부 도달했다.
+    assert run(3_500, states, lad) == []
+    # 사이클 전체가 -65% 인 극단값에서도 마찬가지다.
+    assert run(100, states, lad) == []
+
+
 def test_sell_reason_records_basis():
     lad = ladder()
     states = [stage(lad, 3, StageStatus.HOLDING, fill_price=8_950, fill_qty=111)]

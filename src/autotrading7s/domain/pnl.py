@@ -16,7 +16,15 @@ _CENT = Decimal("0.01")
 
 
 def _held(states: Iterable[StageState]) -> list[StageState]:
-    return [s for s in states if s.held_qty > 0 and s.fill_price is not None]
+    """보유 중인 단계. 조건은 ``held_qty > 0`` 하나뿐이다.
+
+    ``fill_price is not None`` 을 함께 걸지 않는다 —
+    ``StageState.__post_init__`` 이 보유 상태에 체결가가 있음을 이미 보장하고,
+    같은 데이터를 두 술어로 거르면 둘이 어긋날 때 ``invested_amount`` 만
+    과소 집계되어 총한도가 실제보다 헐거워진다. 불변식이 깨지면 조용히
+    헐거워지는 대신 ``TypeError`` 로 터지는 것이 맞다.
+    """
+    return [s for s in states if s.held_qty > 0]
 
 
 def invested_amount(states: Sequence[StageState]) -> int:

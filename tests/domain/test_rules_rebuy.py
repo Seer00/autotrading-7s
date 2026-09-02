@@ -117,7 +117,8 @@ def test_rebuy_reason_marks_rebuy():
     assert "cooldown_ok" in reason
 
 
-# Finding A — naive/aware datetime mixing must raise ValueError, not TypeError.
+# naive/aware datetime 혼용은 ValueError 로 원인을 밝힌다 — 그냥 빼면 TypeError
+# 가 나지만 그 예외는 어느 단계·어느 필드가 원인인지 알려주지 않는다.
 def test_naive_last_sold_at_raises_value_error():
     lad = ladder()
     params = TriggerParams(target_pct=FIVE, allow_rebuy=True, rebuy_cooldown_sec=60)
@@ -136,8 +137,9 @@ def test_naive_now_raises_value_error():
         run(9_500, states, lad, params, naive_now)
 
 
-# Finding B — a clock regression (now before last_sold_at) blocks the rebuy
-# rather than raising. Documented and pinned, not "fixed".
+# 시계 역행(now 가 last_sold_at 보다 이전)은 예외가 아니라 재매수 차단으로
+# 처리된다. 경과 시간을 알 수 없을 때 거래하지 않는 것이 안전한 방향이므로
+# 의도된 동작이며, "고치지 않고" 못박는다.
 def test_clock_regression_blocks_rebuy_without_raising():
     lad = ladder()
     params = TriggerParams(target_pct=FIVE, allow_rebuy=True, rebuy_cooldown_sec=60)

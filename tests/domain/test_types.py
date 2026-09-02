@@ -119,6 +119,47 @@ def test_market_sell_request_rejects_bool_qty():
                           reason="test")
 
 
+def test_market_sell_request_has_no_credit_fields():
+    """설계서 6절: 주문 DTO 는 복수다 — 긴급청산 경로도 신용·미수 필드가 없다."""
+    names = {f.name for f in dataclasses.fields(MarketSellRequest)}
+    assert names == {"code", "qty", "client_ref", "reason"}
+    forbidden = {"credit", "credit_type", "loan", "loan_type", "margin", "misu"}
+    assert names & forbidden == set()
+
+
+def test_market_sell_request_rejects_nonpositive_qty():
+    """수량 0 이하의 청산 주문은 존재할 수 없다."""
+    with pytest.raises(ValueError, match="qty must be positive"):
+        MarketSellRequest(code="005930", qty=0, client_ref=uuid4(), reason="test")
+    with pytest.raises(ValueError, match="qty must be positive"):
+        MarketSellRequest(code="005930", qty=-316, client_ref=uuid4(), reason="test")
+
+
+@pytest.mark.parametrize("field", ["qty", "avg_price"])
+@pytest.mark.parametrize("bad_value", [100.5, True, Decimal(100)])
+def test_holding_rejects_non_int_fields(field: str, bad_value: object):
+    """보유 수량은 MarketSellRequest.qty 로 흘러간다 — 설계서 11.1절은 그
+    수량을 실제 계좌에서 가져오라고 요구하므로, 여기가 그 값의 경계다."""
+    kwargs = {"code": "005930", "qty": 316, "avg_price": 9_458}
+    kwargs[field] = bad_value
+    with pytest.raises(TypeError, match=f"{field} must be int"):
+        Holding(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field", ["qty", "avg_price"])
+def test_holding_rejects_negative_fields(field: str):
+    kwargs = {"code": "005930", "qty": 316, "avg_price": 9_458}
+    kwargs[field] = -1
+    with pytest.raises(ValueError, match=f"{field} must be non-negative"):
+        Holding(**kwargs)  # type: ignore[arg-type]
+
+
+def test_holding_allows_zero_qty():
+    """전량 매도된 종목이 잔고에 0주로 남아 오는 것은 정상이다."""
+    holding = Holding(code="005930", qty=0, avg_price=0)
+    assert holding.qty == 0
+
+
 def test_balance_qty_of():
     bal = Balance(cash=1_000_000, holdings=(
         Holding(code="005930", qty=316, avg_price=9458),

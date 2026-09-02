@@ -62,10 +62,27 @@ def test_normalize_sell_ceils(raw: Decimal, expected: int):
     assert normalize_tick(raw, Side.SELL) == expected
 
 
-def test_normalize_sell_crossing_unit_boundary_stays_valid():
-    """올림이 구간 경계를 넘어도 결과는 유효 호가여야 한다."""
-    assert normalize_tick(Decimal("19998"), Side.SELL) == 20_000
-    assert normalize_tick(Decimal("4999"), Side.SELL) == 5_000
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (Decimal("1999.5"), 2_000),      # 1원 → 5원 구간
+        (Decimal("4999"), 5_000),        # 5원 → 10원 구간
+        (Decimal("19998"), 20_000),      # 10원 → 50원 구간
+        (Decimal("49999"), 50_000),      # 50원 → 100원 구간
+        (Decimal("199999"), 200_000),    # 100원 → 500원 구간
+        (Decimal("499999"), 500_000),    # 500원 → 1,000원 구간
+    ],
+)
+def test_normalize_sell_crossing_unit_boundary_stays_valid(raw: Decimal, expected: int):
+    """올림이 구간 경계를 넘어도 결과는 유효 호가여야 한다.
+
+    `normalize_tick` 의 docstring 은 이것을 일반 성질로 주장한다("경계를
+    넘어도 결과는 항상 유효 호가"). 여섯 경계를 전부 못박아, 구간표가 바뀌어
+    다음 구간 단위의 배수가 아닌 경계가 생기면 즉시 드러나게 한다.
+    """
+    result = normalize_tick(raw, Side.SELL)
+    assert result == expected
+    assert result % tick_unit(result) == 0, "올림 결과 자체가 유효 호가여야 한다"
 
 
 def test_normalize_rejects_float():
