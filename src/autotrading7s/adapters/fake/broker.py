@@ -126,9 +126,16 @@ class FakeBroker:
         self._fail_mode = FailMode.NONE
         self._calls = 0
 
-    def _should_fail(self) -> bool:
-        """fail_after 번째 호출까지는 통과시키고 그 다음부터 실패한다."""
-        if self._fail_mode is FailMode.NONE:
+    def _should_fail(self, *applicable: FailMode) -> bool:
+        """fail_after 번째 호출까지는 통과시키고 그 다음부터 실패한다.
+
+        `applicable` 은 호출부가 실제로 실패시킬 수 있는 모드들이다. 현재
+        `fail_mode` 가 그 안에 없으면(예: `get_balance` 가 `REJECT` 모드에서
+        불렸을 때) 카운터를 건드리지 않고 `False` 를 반환한다 — 그래야
+        `fail_after` 가 "실패할 수 있었던 호출 N번"이라는 깨끗한 의미를 갖는다.
+        무관한 호출이 카운터를 몰래 소모하면 그 의미가 깨진다.
+        """
+        if self._fail_mode not in applicable:
             return False
         self._calls += 1
         return self._calls > self._fail_after
@@ -173,17 +180,16 @@ class FakeBroker:
     def _accept(
         self, client_ref: UUID, code: str, side: Side, qty: int, price: int | None
     ) -> OrderAck:
-        if self._should_fail():
+        if self._should_fail(FailMode.REJECT, FailMode.TIMEOUT):
             if self._fail_mode is FailMode.REJECT:
                 # 명시적 거부는 주문을 등록하지 않는다 — 미접수가 확실하다.
                 raise BrokerRejected("40510", "주문 거부 (시뮬레이션)")
-            if self._fail_mode is FailMode.TIMEOUT:
-                # 타임아웃은 등록한 뒤 던진다. 실제 타임아웃의 성질이 그렇고,
-                # 설계서 9절 ⑤ 의 "접수됨" 분기를 테스트할 수 있게 하는 장치다.
-                self._register(client_ref, code, side, qty, price)
-                raise BrokerTimeout("no response from broker (simulated)")
-            if self._fail_mode is FailMode.DISCONNECT:
-                raise BrokerDisconnected("stream lost (simulated)")
+            # TIMEOUT: 등록한 뒤 던진다. 실제 타임아웃의 성질이 그렇고, 설계서
+            # 9절 ⑤ 의 "접수됨" 분기를 테스트할 수 있게 하는 장치다.
+            self._register(client_ref, code, side, qty, price)
+            raise BrokerTimeout("no response from broker (simulated)")
+        # DISCONNECT 는 시세 스트림 전용이다 — 주문 경로를 막지 않는다. 설계서
+        # 8.4절: WS 가 끊겨도 REST 폴링으로 전환해 트리거 판정과 발주는 계속된다.
         return OrderAck(
             client_ref=client_ref,
             broker_order_id=self._register(client_ref, code, side, qty, price),
@@ -275,7 +281,7 @@ class FakeBroker:
         일부러 "보유 0" 쪽을 만든다. "응답에 없음"을 재현하려면 `_positions`
         에서 항목을 지우는 별도 경로가 필요하며 현재는 만들지 않았다.
         """
-        if self._should_fail() and self._fail_mode is FailMode.TIMEOUT:
+        if self._should_fail(FailMode.TIMEOUT):
             raise BrokerTimeout("no response from broker (simulated)")
         holdings = tuple(
             Holding(code=code, qty=qty,

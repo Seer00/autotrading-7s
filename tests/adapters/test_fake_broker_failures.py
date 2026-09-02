@@ -16,6 +16,10 @@ from autotrading7s.domain.types import FillState, LimitOrderRequest, MarketSellR
 
 pytestmark = pytest.mark.asyncio
 
+# 이 파일에 FailMode.NONE 을 직접 검증하는 테스트는 없다 — 그 기본값 동작은
+# Task 11 의 tests/adapters/test_fake_broker.py 19건이 계속 통과하는 것으로
+# 이미 덮인다(추가만 하는 제약상 그 19건이 기본 경로의 회귀 테스트다).
+
 
 def a_buy(price: int = 9_500, qty: int = 105) -> LimitOrderRequest:
     return LimitOrderRequest(code="005930", side=Side.BUY, qty=qty, price=price,
@@ -84,8 +88,8 @@ async def test_reject_carries_a_code_and_message():
     broker = FakeBroker([9_500], fail_mode=FailMode.REJECT)
     with pytest.raises(BrokerRejected) as exc:
         await broker.place_limit_order(a_buy())
-    assert exc.value.code
-    assert exc.value.message
+    assert exc.value.code == "40510"
+    assert exc.value.message == "주문 거부 (시뮬레이션)"
 
 
 async def test_reject_leaves_the_balance_untouched():
@@ -135,6 +139,35 @@ async def test_get_balance_can_also_fail():
     broker = FakeBroker([9_500], fail_mode=FailMode.TIMEOUT)
     with pytest.raises(BrokerTimeout):
         await broker.get_balance()
+
+
+async def test_get_balance_under_reject_does_not_consume_the_order_fail_budget():
+    """Fix round 1, finding 1. get_balance 는 REJECT 를 발동시키지 않으므로
+    무관한 조회가 fail_after 카운터를 몰래 깎아서는 안 된다 — 그러면 나중에
+    성공해야 할 주문이 대신 거부당한다."""
+    broker = FakeBroker([9_500], fail_mode=FailMode.REJECT, fail_after=1)
+    await broker.get_balance()  # REJECT 에 적용되지 않는 호출 — 카운터를 건드리지 않아야 한다
+    await broker.place_limit_order(a_buy())  # 첫 주문은 여전히 성공해야 한다
+
+
+async def test_get_balance_under_timeout_still_consumes_and_raises():
+    """Fix round 1, finding 1의 반대쪽 절반. TIMEOUT 은 get_balance 에도 적용되므로
+    fail_after 를 넘긴 뒤에는 여전히 실패해야 한다."""
+    broker = FakeBroker([9_500], fail_mode=FailMode.TIMEOUT, fail_after=1)
+    await broker.get_balance()  # 1번째 호출 — 예산 안, 성공
+    with pytest.raises(BrokerTimeout):
+        await broker.get_balance()  # 2번째 호출 — 예산 초과, 실패
+
+
+async def test_orders_still_go_out_while_the_stream_is_disconnected():
+    """Fix round 1, finding 2. 설계서 8.4절 — WS 가 끊기면 REST 폴링으로
+    전환되지만 트리거 판정과 발주는 계속된다. DISCONNECT 는 시세 스트림 전용이고
+    주문 경로를 막지 않는다."""
+    broker = FakeBroker([9_500], fail_mode=FailMode.DISCONNECT,
+                        fill_mode=FillMode.INSTANT)
+    ack = await broker.place_limit_order(a_buy())
+    status = await broker.get_order(ack.broker_order_id)
+    assert status.state is FillState.FILLED
 
 
 async def test_failure_modes_are_deterministic():
