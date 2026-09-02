@@ -2430,6 +2430,18 @@ def test_load_stages_of_a_starting_cycle_skips_h4(repo):
 Run: `.venv/bin/python -m pytest tests/adapters/sqlite/test_repository_core.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'autotrading7s.adapters.sqlite.repository'`
 
+**실행 중 발견된 빈틈 (커밋 e6ab49c).** 아래 코드 블록의 초안은 실제 SQLite 연결에서
+동작하지 않았다. `mapping.py` 가 오류 귀속을 위해 `row.get("id")` 를 쓰는데
+`connect()` 가 설정하는 `sqlite3.Row` 에는 `.get()` 이 없다
+(`issubclass(sqlite3.Row, Mapping)` 은 `False`). 이 계획의 매핑 테스트는 평범한
+`dict` 만 넘기므로 그 이음새가 검증되지 않았고, Task 8 이 첫 실제 통합 지점이었다.
+
+**모든 fetch 지점에서 `dict(row)` 로 변환해 `mapping` 에 넘긴다.** 이것은 우회가
+아니라 더 나은 선택이다 — `sqlite3.Row["없는키"]` 는 `IndexError` 를,
+`dict["없는키"]` 는 `KeyError` 를 낸다. 변환하지 않으면 테스트와 운영의 예외
+클래스가 달라져 테스트로 재현할 수 없는 실패 모드가 생긴다. Tasks 9·10 의 새 fetch
+지점도 같이 변환해야 한다(잊으면 `AttributeError` 가 즉시 나므로 조용하지는 않다).
+
 - [ ] **Step 3: `repository.py` 의 설정 부분 작성**
 
 ```python
